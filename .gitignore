@@ -2,3 +2,9 @@ pinscan.elf
 pinscan.bin
 pinscan.map
 fw_flash.asm
+drone/drone.elf
+drone/drone.bin
+drone/drone.map
+ground/ground.elf
+ground/ground.bin
+ground/ground.map
