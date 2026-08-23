@@ -79,6 +79,13 @@ typedef struct {
     volatile uint32_t mpu_ok;   /* 1 once the device answered and left sleep    */
     volatile int16_t  mpu[7];   /* ax ay az temp gx gy gz, raw big-endian regs  */
     volatile int16_t  mpu_pad;
+    volatile uint32_t ce_pin;     /* 0xFF until found                          */
+    volatile uint32_t irq_pin;    /* 0xFF until found                          */
+    volatile uint32_t bk_status;  /* STATUS after the transmit that identified CE */
+    volatile uint32_t bk_config;  /* CONFIG read back, proves the link is sane  */
+    volatile uint32_t bk_tried;   /* how many pins were exercised               */
+    volatile uint32_t bk_null;    /* STATUS after a transmit with NO pin pulsed  */
+    volatile uint32_t hb_count;   /* heartbeat toggles: lets the host clock the CPU */
 } res_t;
 
 res_t res __attribute__((section(".results")));
@@ -398,6 +405,242 @@ static void mpu_poll(void)
     res.mpu_seq++;
 }
 
+/* ---- BK2425 over the pins the scan found: CSN PA4, SCK PA5, MISO PA6, MOSI PA7 ----
+ * Still bit-banged. The point here is finding CE and IRQ, and bit-banging keeps
+ * this independent of any AF wiring mistake. */
+#define BK_CSN  PC(0, 4)
+#define BK_SCK  PC(0, 5)
+#define BK_MISO PC(0, 6)
+#define BK_MOSI PC(0, 7)
+
+static uint8_t spi_byte(uint8_t out)
+{
+    uint8_t in = 0;
+    for (int i = 7; i >= 0; i--) {
+        if ((out >> i) & 1) pin_hi(BK_MOSI); else pin_lo(BK_MOSI);
+        dly(SPI_HALF);
+        pin_hi(BK_SCK);
+        in |= (uint8_t)(pin_rd(BK_MISO) << i);
+        dly(SPI_HALF);
+        pin_lo(BK_SCK);
+        dly(SPI_HALF);
+    }
+    return in;
+}
+
+static void bk_pins(void)
+{
+    pin_hi(BK_CSN);  pin_out(BK_CSN);
+    pin_lo(BK_SCK);  pin_out(BK_SCK);
+    pin_lo(BK_MOSI); pin_out(BK_MOSI);
+    pin_in(BK_MISO, 0);
+}
+
+static uint8_t bk_cmd1(uint8_t cmd)
+{
+    pin_lo(BK_CSN); dly(SPI_HALF);
+    uint8_t st = spi_byte(cmd);
+    pin_hi(BK_CSN); dly(SPI_HALF);
+    return st;
+}
+
+static uint8_t bk_rd(uint8_t reg)
+{
+    pin_lo(BK_CSN); dly(SPI_HALF);
+    spi_byte(reg & 0x1F);
+    uint8_t v = spi_byte(0xFF);
+    pin_hi(BK_CSN); dly(SPI_HALF);
+    return v;
+}
+
+static void bk_wr(uint8_t reg, uint8_t val)
+{
+    pin_lo(BK_CSN); dly(SPI_HALF);
+    spi_byte(0x20 | (reg & 0x1F));
+    spi_byte(val);
+    pin_hi(BK_CSN); dly(SPI_HALF);
+}
+
+static void bk_payload(void)
+{
+    pin_lo(BK_CSN); dly(SPI_HALF);
+    spi_byte(0xA0);                       /* W_TX_PAYLOAD */
+    for (int i = 0; i < 4; i++) spi_byte((uint8_t)(0xA5 + i));
+    pin_hi(BK_CSN); dly(SPI_HALF);
+}
+
+/* ---- phase 7: find CE and IRQ ----
+ * CE is a plain input, so it cannot be read back. It is identified by what it
+ * causes: with a payload sitting in the TX FIFO, only a pulse on the real CE
+ * makes the radio transmit, which sets TX_DS and empties the FIFO. IRQ is an
+ * output, so it is caught by snapshotting every port before and after. */
+static void ce_hunt(void)
+{
+    /* pins already accounted for: SPI, I2C, LED, the four motors, and the two
+     * suspected UART lines, which are left alone in case the adapter drives them */
+    static const uint8_t SKIP[] = {
+        PC(0,4), PC(0,5), PC(0,6), PC(0,7),      /* BK2425 SPI  */
+        PC(1,6), PC(1,7),                        /* MPU6050 I2C */
+        PC(0,1),                                 /* LED         */
+        PC(0,2), PC(0,3), PC(0,8), PC(0,11),     /* motors      */
+        PC(0,9), PC(0,10),                       /* suspected UART */
+    };
+
+    res.ce_pin = res.irq_pin = 0xFF;
+    res.bk_tried = 0;
+    res.hb_count = 0;
+
+    all_idle();
+    bk_pins();
+    dly(20000);
+
+    bk_wr(0x00, 0x0A);      /* CONFIG: PWR_UP, PRIM_RX=0 (TX), CRC enabled */
+    dly(60000);             /* power-up settling, well past the 1.5 ms minimum */
+    bk_wr(0x01, 0x00);      /* EN_AA off, so a transmit completes with no receiver */
+    bk_wr(0x04, 0x00);      /* SETUP_RETR: no retransmits */
+    bk_wr(0x06, 0x06);      /* RF_SETUP: 1 Mbps, max power */
+    res.bk_config = bk_rd(0x00);
+
+    /* Control trial: same sequence, no pin pulsed. If TX_DS sets anyway then CE
+     * is strapped high on the board and every per-pin result below is a false
+     * positive, so the control has to be read before trusting ce_pin. */
+    bk_cmd1(0xE1);
+    bk_wr(0x07, 0x70);
+    bk_payload();
+    dly(8000);
+    res.bk_null = bk_rd(0x07);
+    bk_cmd1(0xE1);
+    bk_wr(0x07, 0x70);
+
+    for (uint32_t i = 0; i < NCAND; i++) {
+        uint8_t c = CAND[i];
+        uint32_t skip = 0;
+        for (uint32_t k = 0; k < sizeof(SKIP); k++) if (SKIP[k] == c) skip = 1;
+        if (skip) continue;
+
+        bk_cmd1(0xE1);              /* FLUSH_TX */
+        bk_wr(0x07, 0x70);          /* clear RX_DR / TX_DS / MAX_RT */
+        bk_payload();
+        res.bk_tried++;
+
+        uint32_t before[3];
+        for (uint32_t k = 0; k < 3; k++) before[k] = PORTS[k]->IDR;
+
+        pin_lo(c); pin_out(c);      /* CE idles low */
+        dly(200);
+        pin_hi(c);                  /* pulse: far longer than the 10 us minimum */
+        dly(4000);
+        pin_lo(c);
+        dly(4000);
+
+        uint32_t after[3];
+        for (uint32_t k = 0; k < 3; k++) after[k] = PORTS[k]->IDR;
+
+        uint8_t st = bk_rd(0x07);
+        pin_in(c, 2);
+
+        if (!(st & 0x20)) continue;         /* TX_DS did not set: not CE */
+
+        res.ce_pin    = c;
+        res.bk_status = st;
+
+        /* IRQ is active low, so look for a pin that fell and is not CE itself */
+        for (uint32_t m = 0; m < NCAND; m++) {
+            uint8_t q = CAND[m];
+            if (q == c) continue;
+            uint32_t b = (before[PORT_OF(q)] >> PIN_OF(q)) & 1u;
+            uint32_t a = (after[PORT_OF(q)]  >> PIN_OF(q)) & 1u;
+            if (b == 1 && a == 0) { res.irq_pin = q; break; }
+        }
+        break;
+    }
+    bk_wr(0x07, 0x70);
+    all_idle();
+}
+
+/* ---- phase 8: find IRQ ----
+ * CE turned out to be strapped high, so the radio transmits the moment a
+ * payload lands in the FIFO. That invalidated the IRQ search in phase 7, whose
+ * "before" snapshot was taken after the transmit had already pulled IRQ low.
+ * Here the order is fixed: clear STATUS so IRQ releases high, snapshot, then
+ * write the payload and let the transmit pull it low. */
+static void irq_hunt(void)
+{
+    res.irq_pin = 0xFF;
+
+    all_idle();
+    bk_pins();
+    dly(20000);
+    bk_wr(0x00, 0x0A);
+    dly(60000);
+    bk_wr(0x01, 0x00);
+    bk_wr(0x04, 0x00);
+
+    bk_cmd1(0xE1);              /* FLUSH_TX */
+    bk_wr(0x07, 0x70);          /* clear flags: IRQ releases high */
+    dly(8000);
+
+    uint32_t before[3];
+    for (uint32_t k = 0; k < 3; k++) before[k] = PORTS[k]->IDR;
+
+    bk_payload();               /* CE is strapped high, so this transmits */
+    dly(20000);
+
+    uint32_t after[3];
+    for (uint32_t k = 0; k < 3; k++) after[k] = PORTS[k]->IDR;
+
+    res.bk_status = bk_rd(0x07);
+
+    for (uint32_t m = 0; m < NCAND; m++) {
+        uint8_t q = CAND[m];
+        uint32_t b = (before[PORT_OF(q)] >> PIN_OF(q)) & 1u;
+        uint32_t a = (after[PORT_OF(q)]  >> PIN_OF(q)) & 1u;
+        if (b == 1 && a == 0) { res.irq_pin = q; break; }
+    }
+
+    bk_wr(0x07, 0x70);
+    all_idle();
+}
+
+/* ---- phase 10: hardware USART1 on PA9 ----
+ * The bit-banged UART never produced readable output, and the CPU clock was
+ * measured at 8.1 MHz, so the timing assumption was not the problem. This drops
+ * software timing entirely: USART1's own baud generator divides the clock. If
+ * this is still unreadable, the fault is the wiring or the signal polarity, not
+ * the firmware. */
+#define RCC_APB2ENR (*(volatile uint32_t *)0x40021018u)
+#define USART1_CR1  (*(volatile uint32_t *)0x40013800u)
+#define USART1_BRR  (*(volatile uint32_t *)0x4001380Cu)
+#define USART1_ISR  (*(volatile uint32_t *)0x4001381Cu)
+#define USART1_TDR  (*(volatile uint32_t *)0x40013828u)
+
+static void hw_uart_begin(void)
+{
+    RCC_APB2ENR |= (1u << 14);           /* USART1 clock */
+
+    /* PA9 -> AF1 (USART1_TX) */
+    GPIOA->AFR[1] = (GPIOA->AFR[1] & ~(0xFu << 4)) | (1u << 4);
+    GPIOA->OTYPER &= ~(1u << 9);
+    GPIOA->PUPDR  &= ~(3u << 18);
+    GPIOA->MODER   = (GPIOA->MODER & ~(3u << 18)) | (2u << 18);
+
+    USART1_CR1 = 0;
+    USART1_BRR = 833;                    /* 8 MHz / 9600 */
+    USART1_CR1 = (1u << 3) | (1u << 0);  /* TE, UE */
+}
+
+static void hw_putc(char c)
+{
+    while (!(USART1_ISR & (1u << 7))) { }   /* TXE */
+    USART1_TDR = (uint32_t)(uint8_t)c;
+}
+
+static void hw_uart_tick(void)
+{
+    static const char MSG[] = "PINSCAN-HW-UART PA9 9600\r\n";
+    for (const char *q = MSG; *q; q++) hw_putc(*q);
+}
+
 /* ---- report ---- */
 static void report(void)
 {
@@ -485,6 +728,9 @@ static void interact(void)
                 active = 0xFF;
             }
             else if (mode == 6) { mpu_begin(); active = 0xFF; }
+            else if (mode == 7) { ce_hunt();  active = 0xFF; mode = 0; }
+            else if (mode == 8) { irq_hunt(); active = 0xFF; mode = 0; }
+            else if (mode == 10) { hw_uart_begin(); active = 0xFF; }
             else                { active = 0xFF; }
 
             if (keep_tx != 0xFF && active != 0xFF) {
@@ -502,9 +748,12 @@ static void interact(void)
             if (hb_acc >= HB_CYCLES) {
                 hb_acc = 0;
                 hb_level ^= 1;
+                res.hb_count++;
                 if (hb_level) pin_hi(HB_PIN); else pin_lo(HB_PIN);
             }
         }
+
+        if (mode == 10) { hw_uart_tick(); dly(300000); }
 
         if (mode == 6) { mpu_poll(); dly(20000); }
 
@@ -536,6 +785,9 @@ int main(void)
     res.mask[0] = res.mask[1] = res.mask[2] = 0;
     res.mpu_seq = 0;
     res.mpu_ok = 0;
+    res.ce_pin = res.irq_pin = 0xFF;
+    res.bk_tried = 0;
+    res.hb_count = 0;
 
     res.phase = 1; census();
     res.phase = 2; i2c_scan();

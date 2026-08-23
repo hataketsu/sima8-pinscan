@@ -37,8 +37,8 @@ this repo is what produced them.
 | PA6  | BK2425 MISO  | SPI1_MISO | `RX_ADDR_P0` read back `0xE7` |
 | PA7  | BK2425 MOSI  | SPI1_MOSI | `RX_ADDR_P0` read back `0xE7` |
 | PA8  | Motor M3     | TIM1_CH1  | subset-encoding rounds A/B |
-| PA9  | UART TX?     | USART1_TX | unconfirmed — left alone, adapter attached |
-| PA10 | UART RX?     | USART1_RX | census reads it externally high |
+| PA9  | UART TX      | USART1_TX | hardware USART1 at 9600 produced clean output |
+| PA10 | UART RX?     | USART1_RX | census reads it externally high; TX side confirmed, RX not yet |
 | PA11 | Motor M4     | TIM1_CH4  | driven alone, only M4 conducted |
 | PA13 | SWDIO        | —         | debug link, never driven |
 | PA14 | SWCLK        | —         | debug link, never driven |
@@ -69,6 +69,24 @@ Two consequences:
 2. At reset the pins are floating inputs, so the gates are undefined and the
    motors can spin. `Reset_Handler` must drive PA2, PA3, PA8 and PA11 **high**
    before it does anything else. Keep the props off until that path is proven.
+
+## Radio wiring
+
+The BK2425 needs only its four SPI lines. Neither CE nor IRQ is under MCU
+control:
+
+- **CE is strapped high on the board.** Phase 7 first reported PA0 as CE, on the
+  strength of TX_DS setting after PA0 was pulsed. A control trial — the same
+  sequence with no pin pulsed at all — set TX_DS just the same (`0x2E` both
+  times), which means the radio transmits the moment a payload reaches the FIFO
+  and no pin was responsible. PA0 was a false positive and was discarded.
+- **IRQ is not connected.** With the ordering corrected so the snapshot is taken
+  while IRQ is released, a confirmed transmit (`STATUS = 0x2E`, TX_DS set) moved
+  no pin from high to low. Poll STATUS instead.
+
+Both facts simplify the driver: no CE strobe to sequence, no interrupt line to
+service. Mode switching happens through the PRIM_RX bit in CONFIG, which works
+because CE is permanently asserted.
 
 ## Sensor check
 
@@ -145,10 +163,19 @@ Pin codes are `port << 4 | pin`, with port 0 = A, 1 = B, 2 = F. Drive modes are
 Note that openocd halts the CPU on `init` and leaves it halted on `shutdown`, so
 every read must end with `resume` or the firmware freezes mid-scan.
 
+## Measured CPU clock
+
+The heartbeat counter doubles as a clock check: counting toggles over a known
+interval put the core at **8.10 MHz**, within 1.3% of the nominal 8 MHz HSI, so
+software timing loops can be trusted.
+
+Worth knowing: the bit-banged UART in this firmware never produced readable
+output at any standard baud rate, on any pin, even with the clock confirmed.
+Hardware USART1 on PA9 worked on the first attempt. Use the peripheral.
+
 ## Still open
 
-- PB0 and PF0 are unexplained.
-- PA9/PA10 are assumed to be the UART but were never confirmed; the bit-banged
-  UART never produced readable output at any standard baud rate.
+- PB0, PF0 and PA0 are unexplained.
+- PA10 is assumed to be UART RX; only the TX direction has been confirmed.
 - `fw_flash.bin` is a dump of a test image that was on the chip, not the stock
   Sima firmware. The original is gone.
