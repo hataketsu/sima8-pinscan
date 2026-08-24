@@ -44,7 +44,9 @@ def parse(line):
     with lock:
         state["lines"] = (state["lines"] + [line])[-40:]
         state["updated"] = time.time()
-        if line.startswith("tx sent="):
+        if line.startswith("TLM "):
+            pass  # handled outside the lock below
+        elif line.startswith("tx sent="):
             for tok in line.split():
                 if "=" not in tok:
                     continue
@@ -62,15 +64,13 @@ def parse(line):
         elif line.startswith("DISARMED"):
             state["armed"] = False
             state["throttle"] = 0
+    if line.startswith("TLM "):
+        parse_imu_fields(line.split())
 
 
-def parse_drone(line):
-    """The drone prints: IMU ok ax ay az gx gy gz, in raw counts."""
-    with lock:
-        state["drone_lines"] = (state["drone_lines"] + [line])[-40:]
-    if not line.startswith("IMU "):
-        return
-    f = line.split()
+def parse_imu_fields(f):
+    """Common tail of 'IMU ok ...' (drone UART) and 'TLM ok ...' (over RF):
+    ok/mat then ax ay az gx gy gz in raw counts."""
     if len(f) != 8:
         return
     try:
@@ -86,6 +86,13 @@ def parse_drone(line):
         # and wrong under acceleration. Good enough to read a tilt off a bench.
         state["roll_deg"] = math.degrees(math.atan2(ay, az))
         state["pitch_deg"] = math.degrees(math.atan2(-ax, math.hypot(ay, az)))
+
+
+def parse_drone(line):
+    with lock:
+        state["drone_lines"] = (state["drone_lines"] + [line])[-40:]
+    if line.startswith("IMU "):
+        parse_imu_fields(line.split())
 
 
 def drone_reader():
