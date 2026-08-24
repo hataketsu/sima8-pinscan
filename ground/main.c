@@ -13,6 +13,12 @@
 #include <stdint.h>
 #include "../common/protocol.h"
 
+#define RCC_APB1ENR (*(volatile uint32_t *)0x4002101Cu)
+#define PWR_CR      (*(volatile uint32_t *)0x40007000u)
+#define BKP_DR4     (*(volatile uint32_t *)0x40006C10u)
+#define SCB_AIRCR   (*(volatile uint32_t *)0xE000ED0Cu)
+#define RCC_CR      (*(volatile uint32_t *)0x40021000u)
+#define RCC_CFGR    (*(volatile uint32_t *)0x40021004u)
 #define RCC_APB2ENR (*(volatile uint32_t *)0x40021018u)
 #define IOPAEN      (1u << 2)
 #define IOPBEN      (1u << 3)
@@ -46,6 +52,10 @@ typedef struct {
 
 #define PIN_CSN 4
 #define PIN_CE  0            /* on port B */
+#define PIN_LED 13           /* on port C, active low on this board */
+
+#define GPIOC ((gpio_t *)0x40011000u)
+#define IOPCEN (1u << 4)
 
 static void cfg_pin(gpio_t *g, uint32_t pin, uint32_t cnf)
 {
@@ -79,14 +89,35 @@ static void delay_us(uint32_t n)          /* short waits, CE pulse width */
     while (((start - STK_VAL) & 0xFFFFFFu) < want) { }
 }
 
+/* Reboot into the HID bootloader.
+ *
+ * The bootloader decides whether to stay resident by reading backup register
+ * DR4: non-zero keeps it, zero makes it jump straight to the application. So
+ * the only way back without touching BOOT0 is to set that register and reset. */
+static void reboot_to_bootloader(void)
+{
+    RCC_APB1ENR |= (1u << 28) | (1u << 27);   /* PWREN, BKPEN */
+    PWR_CR      |= (1u << 8);                 /* DBP: allow backup writes */
+    BKP_DR4      = 0x424C;                    /* any non-zero value will do */
+    PWR_CR      &= ~(1u << 8);
+    SCB_AIRCR    = 0x05FA0004u;               /* system reset request */
+    for (;;) { }
+}
+
 /* ---- UART ---- */
 static void uart_init(void)
 {
     RCC_APB2ENR |= USART1EN;
-    cfg_pin(GPIOA, 9, CNF_AF_PP);
+    cfg_pin(GPIOA, 9,  CNF_AF_PP);       /* TX */
+    cfg_pin(GPIOA, 10, CNF_IN_FLOAT);    /* RX */
     USART1_CR1 = 0;
     USART1_BRR = 833;                      /* 8 MHz / 9600 */
-    USART1_CR1 = (1u << 13) | (1u << 3);   /* UE, TE */
+    USART1_CR1 = (1u << 13) | (1u << 3) | (1u << 2);   /* UE, TE, RE */
+}
+static int uart_getc(void)               /* -1 when nothing is waiting */
+{
+    if (!(USART1_SR & (1u << 5))) return -1;   /* RXNE */
+    return (int)(USART1_DR & 0xFF);
 }
 static void putc_(char c)
 {
@@ -205,6 +236,27 @@ static uint32_t rf_send(const pkt_t *p)
     return 0;
 }
 
+/* The HID bootloader runs the core at 72 MHz so it can drive USB, and hands
+ * over without restoring anything. Inheriting that silently makes every timing
+ * constant here wrong by 9x — the first symptom was UART output arriving at
+ * roughly 86400 baud instead of 9600. The app pins the clock itself instead of
+ * trusting whatever it was started with. */
+static void clock_init_hsi8(void)
+{
+    RCC_CR |= (1u << 0);                       /* HSION */
+    while (!(RCC_CR & (1u << 1))) { }          /* HSIRDY */
+
+    RCC_CFGR &= ~3u;                           /* SW = HSI */
+    while ((RCC_CFGR & (3u << 2)) != 0) { }    /* SWS reports HSI */
+
+    RCC_CR   &= ~(1u << 24);                   /* PLL off */
+    while (RCC_CR & (1u << 25)) { }            /* PLLRDY clear */
+
+    RCC_CFGR &= ~(0xFu << 4);                  /* AHB  prescaler /1 */
+    RCC_CFGR &= ~(7u << 8);                    /* APB1 prescaler /1 */
+    RCC_CFGR &= ~(7u << 11);                   /* APB2 prescaler /1 */
+}
+
 #define SCB_VTOR (*(volatile uint32_t *)0xE000ED08u)
 #define APP_BASE 0x08000800u   /* HID bootloader reserves the first 2 KB */
 
@@ -214,6 +266,7 @@ int main(void)
      * this build polls rather than using interrupts, but leaving VTOR stale is
      * a trap for the first interrupt anyone adds later. */
     SCB_VTOR = APP_BASE;
+    clock_init_hsi8();
 
     RCC_APB2ENR |= IOPAEN | IOPBEN | AFIOEN;
     STK_LOAD = 0x00FFFFFFu; STK_VAL = 0; STK_CTRL = 5;
@@ -230,12 +283,62 @@ int main(void)
     puts_(" RF_CH=");    putdec(rf_rd(REG_RF_CH));
     puts_("\r\n");
 
+    /* PC13 heartbeat, so the board reports liveness without a cable. The LED is
+     * active low here: driving the pin low lights it. */
+    RCC_APB2ENR |= IOPCEN;
+    cfg_pin(GPIOC, PIN_LED, CNF_OUT_PP);
+    uint32_t led_on = 0, last_led = millis();
+
+    puts_("lenh: t<n> ga, r/p/y<n> truc, a arm, d disarm, s status, b bootloader\r\n");
+
+    char line[24];
+    uint32_t li = 0;
+
     pkt_t pkt = { PKT_MAGIC, 0, 0, 128, 128, 128, 0, 0 };
     uint32_t sent = 0, failed = 0;
     uint32_t last_tx = millis(), last_report = last_tx;
 
     for (;;) {
         uint32_t now = millis();
+
+        /* command input, one line at a time */
+        int ch = uart_getc();
+        if (ch >= 0) {
+            if (ch == '\r' || ch == '\n') {
+                line[li] = 0;
+                if (li) {
+                    uint32_t v = 0;
+                    for (uint32_t i = 1; i < li; i++)
+                        if (line[i] >= '0' && line[i] <= '9') v = v * 10 + (uint32_t)(line[i] - '0');
+                    if (v > 255) v = 255;
+                    switch (line[0]) {
+                    case 't': pkt.throttle = (uint8_t)v; puts_("ok throttle\r\n"); break;
+                    case 'r': pkt.roll     = (uint8_t)v; puts_("ok roll\r\n");     break;
+                    case 'p': pkt.pitch    = (uint8_t)v; puts_("ok pitch\r\n");    break;
+                    case 'y': pkt.yaw      = (uint8_t)v; puts_("ok yaw\r\n");      break;
+                    /* arming is refused unless the throttle is already at zero,
+                     * so a stale stick value cannot become thrust */
+                    case 'a':
+                        if (pkt.throttle == 0) { pkt.flags |= PKT_ARM; puts_("ARMED\r\n"); }
+                        else puts_("tu choi: ha throttle ve 0 truoc\r\n");
+                        break;
+                    case 'd': pkt.flags &= (uint8_t)~PKT_ARM; pkt.throttle = 0; puts_("DISARMED\r\n"); break;
+                    case 's': puts_("status theo dong bao cao moi giay\r\n"); break;
+                    case 'b': puts_("vao bootloader...\r\n"); for (volatile int k = 0; k < 200000; k++) { } reboot_to_bootloader(); break;
+                    default:  puts_("lenh la\r\n"); break;
+                    }
+                }
+                li = 0;
+            } else if (li < sizeof(line) - 1) {
+                line[li++] = (char)ch;
+            }
+        }
+
+        if (now - last_led >= 250) {        /* 2 Hz: alive and in the main loop */
+            last_led = now;
+            led_on ^= 1;
+            if (led_on) gp_lo(GPIOC, PIN_LED); else gp_hi(GPIOC, PIN_LED);
+        }
 
         if (now - last_tx >= TX_PERIOD_MS) {
             last_tx = now;
