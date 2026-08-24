@@ -169,10 +169,28 @@ static void uart_init(void)
     USART1_BRR = 833;                   /* 8 MHz / 9600 */
     USART1_CR1 = (1u << 3) | (1u << 0); /* TE, UE */
 }
+/* Transmit through a ring buffer so printing never stalls the main loop:
+ * a blocked putc_ used to hold the loop for the length of a whole line,
+ * overflowing the radio's 3-deep RX FIFO and silently dropping packets.
+ * uart_pump() moves one queued byte to the shifter whenever TXE is set;
+ * putc_ only spins if the queue itself is full, which a 512-byte queue
+ * makes rare (the longest burst of lines is ~200 bytes). */
+#define TXQ_SIZE 512u
+static uint8_t txq[TXQ_SIZE];
+static volatile uint32_t txq_head, txq_tail;
+
+static void uart_pump(void)
+{
+    if (txq_head != txq_tail && (USART1_ISR & (1u << 7))) {
+        USART1_TDR = txq[txq_tail % TXQ_SIZE];
+        txq_tail++;
+    }
+}
 static void putc_(char c)
 {
-    while (!(USART1_ISR & (1u << 7))) { }
-    USART1_TDR = (uint8_t)c;
+    while (txq_head - txq_tail >= TXQ_SIZE) uart_pump();
+    txq[txq_head % TXQ_SIZE] = (uint8_t)c;
+    txq_head++;
 }
 static void puts_(const char *s) { while (*s) putc_(*s++); }
 static void puthex(uint8_t v)
@@ -405,7 +423,7 @@ int main(void)
     pkt_t pkt;
     uint32_t good = 0, bad = 0;
     tlm_t tlm = { TLM_MAGIC, 0, 0,0,0, 0,0,0, 0, 0 };
-    uint32_t last_tlm = 0;
+    uint32_t last_tlm = 0, last_imu = 0;
     uint32_t mpu_ok = mpu_begin();
     /* Received Power Detector: set while incoming power is above about
      * -64 dBm. Sampling it separates "no RF is arriving at all" from "RF
@@ -415,6 +433,7 @@ int main(void)
 
     for (;;) {
         uint32_t now = millis();
+        uart_pump();
 
 #if REVERSE_TEST
         /* CE is strapped high here, so a payload write transmits immediately */
@@ -430,7 +449,12 @@ int main(void)
             rf_wr(REG_STATUS, ST_TX_DS | ST_MAX_RT);
         }
 #endif
-        if (rf_rd(REG_STATUS) & ST_RX_DR) {
+        /* Drain the whole RX FIFO, not just one payload: the UART prints
+         * below block for tens of milliseconds, and packets arriving in the
+         * meantime stack up in the 3-deep FIFO. Reading a single payload per
+         * loop lets it overflow (FIFO_STATUS showed RX_FULL) and silently
+         * drops the rest. RX_EMPTY is FIFO_STATUS bit 0. */
+        while (!(rf_rd(REG_FIFO_STATUS) & 0x01)) {
             rf_rx_payload((uint8_t *)&pkt, RF_PAYLOAD);
             rf_wr(REG_STATUS, ST_RX_DR);
             if (pkt_valid(&pkt)) { good++; last_pkt = now; }
@@ -500,9 +524,15 @@ int main(void)
             puts_(" link=");   puts_(link_up ? "UP" : "DOWN");
             puts_(" motor=");  puts_(motors_live ? "ON" : "off");
             puts_("\r\n");
-            /* One line the host can parse: signed raw counts, no trig here.
-             * The firmware links without libm and the host has far more
-             * precision to spend on the arctangent anyway. */
+        }
+
+        /* One line the host can parse: signed raw counts, no trig here.
+         * The firmware links without libm and the host has far more
+         * precision to spend on the arctangent anyway. 10 Hz keeps the
+         * attitude display fluid while filling under half of the 9600-baud
+         * line; the radio FIFO is 3 deep, enough to ride out each print. */
+        if (now - last_imu >= 100u) {
+            last_imu = now;
             puts_("IMU ");
             puts_(mpu_ok ? "ok " : "mat ");
             putsig(tlm.ax); putc_(' ');
