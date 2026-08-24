@@ -132,12 +132,20 @@ static void motors_engage(void)
     motors_live = 1;
 }
 
-static void motors_set(uint8_t throttle)
+static void motors_write(int32_t m1, int32_t m2, int32_t m3, int32_t m4)
 {
-    /* 0..255 -> 0..PWM_ARR without a divide, which Cortex-M0 lacks */
-    uint32_t duty = ((uint32_t)throttle * (PWM_ARR + 1)) >> 8;
-    TIM2->CCR3 = duty; TIM2->CCR4 = duty;
-    TIM1->CCR1 = duty; TIM1->CCR4 = duty;
+    if (m1 < 0) m1 = 0;
+    if (m2 < 0) m2 = 0;
+    if (m3 < 0) m3 = 0;
+    if (m4 < 0) m4 = 0;
+    if (m1 > (int32_t)PWM_ARR) m1 = PWM_ARR;
+    if (m2 > (int32_t)PWM_ARR) m2 = PWM_ARR;
+    if (m3 > (int32_t)PWM_ARR) m3 = PWM_ARR;
+    if (m4 > (int32_t)PWM_ARR) m4 = PWM_ARR;
+    TIM2->CCR3 = (uint32_t)m1;          /* M1 PA2  */
+    TIM2->CCR4 = (uint32_t)m2;          /* M2 PA3  */
+    TIM1->CCR1 = (uint32_t)m3;          /* M3 PA8  */
+    TIM1->CCR4 = (uint32_t)m4;          /* M4 PA11 */
 }
 
 /* ---- time ---- */
@@ -335,6 +343,8 @@ static uint32_t mpu_begin(void)
     }
     if (!up) return 0;
     delay_ms(20);
+    mpu_wr(0x1A, 0x03);                  /* DLPF 44 Hz: keeps prop vibration
+                                            out of the gyro the PID feeds on */
     mpu_wr(0x1B, 0x00);                  /* gyro  +-250 dps */
     mpu_wr(0x1C, 0x00);                  /* accel +-2 g     */
     mpu_wr(0x19, 0x07);                  /* sample rate divider */
@@ -378,6 +388,130 @@ static void rf_rx_payload(uint8_t *b, uint32_t n)
     spi_xfer(CMD_R_RX_PAYLOAD);
     for (uint32_t i = 0; i < n; i++) b[i] = spi_xfer(CMD_NOP);
     pa_hi(PIN_CSN);
+}
+
+/* ---- flight control ----
+ *
+ * Cascade-free toy-quad stabiliser, all integer, all shifts: no divide
+ * instruction and no libgcc/libm in this build.
+ *
+ * Angle bookkeeping: the accumulators add one gyro sample (LSB, 131 per
+ * deg/s at +-250 dps) every CTL_MS, so one degree of attitude equals
+ * 131 * (1000/CTL_MS) = 26200 units. Accelerometer angles use the
+ * small-angle approximation: ay counts * 92 = the same fixed-point degrees
+ * (16384 counts/g, 57.3 deg/rad: 57.3/16384 * 26200 = 91.6).
+ *
+ * The complementary filter drags the gyro integral toward the accel angle
+ * by 1/128 per cycle: tau = 128 * 5 ms = 0.64 s.
+ *
+ * MOTOR LAYOUT (MIX table) IS AN ASSUMPTION until the motor-test mode has
+ * been used to map M1..M4 pads to airframe corners. Do not fly before
+ * checking it: use 'm' on the ground console (motor test), y 0/64/128/192
+ * to pick the motor, small throttle to spin it, and note which corner moves.
+ */
+#define CTL_MS       5
+#define ONE_DEG      26200
+#define ACC_TO_FP    92
+#define MAX_SP_FP    (30 * ONE_DEG)      /* full stick = 30 degrees      */
+#define TILT_CUT_FP  (60 * ONE_DEG)      /* auto-cut past 60 degrees     */
+#define KP           10                  /* ~4 duty counts per degree    */
+#define KD           2                   /* ~50 counts at 100 deg/s      */
+#define KI           1
+#define I_CLAMP      (40 << 12)
+#define KPY          2                   /* yaw rate P                   */
+
+static int32_t roll_fp, pitch_fp;        /* fused attitude               */
+static int16_t gx0, gy0, gz0;            /* gyro bias from calibration   */
+static int32_t i_roll, i_pitch;
+static uint32_t armed, crash_latch;
+
+/* {roll, pitch, yaw} sign per motor — see the layout warning above. */
+static const int8_t MIX[4][3] = {
+    { -1, +1, -1 },   /* M1 PA2:  assumed front-right, CCW */
+    { +1, -1, -1 },   /* M2 PA3:  assumed rear-left,  CCW */
+    { +1, +1, +1 },   /* M3 PA8:  assumed front-left,  CW */
+    { -1, -1, +1 },   /* M4 PA11: assumed rear-right,  CW */
+};
+
+/* 256 still samples, ~0.9 s. Board must not move during power-up. */
+static void gyro_calibrate(void)
+{
+    int32_t sx = 0, sy = 0, sz = 0;
+    uint8_t b[14];
+    for (uint32_t i = 0; i < 256; i++) {
+        if (mpu_burst(0x3B, b, 14)) {
+            sx += (int16_t)(((uint16_t)b[8]  << 8) | b[9]);
+            sy += (int16_t)(((uint16_t)b[10] << 8) | b[11]);
+            sz += (int16_t)(((uint16_t)b[12] << 8) | b[13]);
+        }
+        delay_ms(2);
+    }
+    gx0 = (int16_t)(sx >> 8);
+    gy0 = (int16_t)(sy >> 8);
+    gz0 = (int16_t)(sz >> 8);
+}
+
+/* One 200 Hz step: fuse attitude, run the PIDs, mix, write the motors.
+ * Inputs are the latest stick packet and the fresh IMU sample. */
+static void flight_step(const pkt_t *cmd, int16_t ax, int16_t ay, int16_t az,
+                        int16_t gx, int16_t gy, int16_t gz)
+{
+    (void)az;
+    int32_t rrate = gx - gx0;            /* roll  rate, gyro LSB */
+    int32_t prate = gy - gy0;            /* pitch rate           */
+    int32_t yrate = gz - gz0;            /* yaw   rate           */
+
+    roll_fp  += rrate;
+    pitch_fp += prate;
+    roll_fp  += (( (int32_t)ay * ACC_TO_FP) - roll_fp)  >> 7;
+    pitch_fp += ((-(int32_t)ax * ACC_TO_FP) - pitch_fp) >> 7;
+
+    if (!armed) return;
+
+    /* Tilt beyond the cut angle while armed: something is upside down or
+     * tumbling. Kill the motors and stay dead until a fresh arm. */
+    int32_t r_abs = roll_fp  < 0 ? -roll_fp  : roll_fp;
+    int32_t p_abs = pitch_fp < 0 ? -pitch_fp : pitch_fp;
+    if (r_abs > TILT_CUT_FP || p_abs > TILT_CUT_FP) {
+        crash_latch = 1;
+        armed = 0;
+        motors_off();
+        return;
+    }
+
+    int32_t base = ((int32_t)cmd->throttle * (PWM_ARR + 1)) >> 8;
+    if (base < 20) {
+        /* idle: props barely turning, no authority — hold everything level
+         * later, do not let the integrators wind up on the ground */
+        i_roll = i_pitch = 0;
+        motors_write(base, base, base, base);
+        return;
+    }
+
+    int32_t sp_r = ((int32_t)cmd->roll  - 128) * (MAX_SP_FP >> 7);   /* 6140/LSB */
+    int32_t sp_p = ((int32_t)cmd->pitch - 128) * (MAX_SP_FP >> 7);
+    int32_t err_r = sp_r - roll_fp;
+    int32_t err_p = sp_p - pitch_fp;
+
+    i_roll  += err_r >> 10;
+    i_pitch += err_p >> 10;
+    if (i_roll  >  I_CLAMP) i_roll  =  I_CLAMP;
+    if (i_roll  < -I_CLAMP) i_roll  = -I_CLAMP;
+    if (i_pitch >  I_CLAMP) i_pitch =  I_CLAMP;
+    if (i_pitch < -I_CLAMP) i_pitch = -I_CLAMP;
+
+    int32_t out_r = ((err_r * KP) >> 16) + ((i_roll  * KI) >> 12) - ((rrate * KD) >> 9);
+    int32_t out_p = ((err_p * KP) >> 16) + ((i_pitch * KI) >> 12) - ((prate * KD) >> 9);
+
+    /* Yaw is rate-only: full stick asks for ~180 deg/s (184 gyro LSB per
+     * stick LSB), P alone brings it there. */
+    int32_t sp_y  = ((int32_t)cmd->yaw - 128) * 184;
+    int32_t out_y = ((sp_y - yrate) * KPY) >> 10;
+
+    motors_write(base + MIX[0][0]*out_r + MIX[0][1]*out_p + MIX[0][2]*out_y,
+                 base + MIX[1][0]*out_r + MIX[1][1]*out_p + MIX[1][2]*out_y,
+                 base + MIX[2][0]*out_r + MIX[2][1]*out_p + MIX[2][2]*out_y,
+                 base + MIX[3][0]*out_r + MIX[3][1]*out_p + MIX[3][2]*out_y);
 }
 
 static uint8_t dbg_cfg, dbg_st, dbg_fifo;
@@ -493,9 +627,11 @@ int main(void)
     pkt_t pkt;
     uint32_t good = 0, bad = 0;
     tlm_t tlm = { TLM_MAGIC, 0, 0,0,0, 0,0,0, 0, 0 };
-    uint32_t last_tlm = 0, last_imu = 0;
+    uint32_t last_tlm = 0, last_imu = 0, last_ctl = 0, last_att = 0;
+    (void)last_tlm;
     uint32_t tlm_due = 0, tlm_sent = 0, tlm_fail = 0, reinits = 0;
     uint32_t mpu_ok = mpu_begin();
+    if (mpu_ok) gyro_calibrate();        /* ~0.9 s; keep the drone still */
     /* Received Power Detector: set while incoming power is above about
      * -64 dBm. Sampling it separates "no RF is arriving at all" from "RF
      * arrives but the packets are being rejected". */
@@ -536,20 +672,67 @@ int main(void)
          * Sending right after a reception lands inside the ground unit's
          * listening window, and only ever transmitting immediately after a
          * good packet guarantees the ground's own transmitter is idle. */
-        if (tlm_due >= 5) {
+        if (tlm_due >= (armed ? 25u : 5u)) {
             tlm_due = 0;
             tlm.sum = tlm_sum(&tlm);
             if (rf_send_tlm(&tlm)) tlm_sent++; else tlm_fail++;
         }
 
         uint32_t link_up = (now - last_pkt < FAILSAFE_MS);
-        uint32_t want = link_up && (pkt.flags & PKT_ARM);
+
+        /* Arm only on a rising edge with the throttle low; the crash latch
+         * (tilt cut) holds everything dead until a disarm clears it. */
+        if (!(pkt.flags & PKT_ARM)) { armed = 0; crash_latch = 0; }
+        else if (!armed && !crash_latch && pkt.throttle < 10 && link_up) {
+            armed = 1;
+            i_roll = i_pitch = 0;
+        }
+        if (!link_up) armed = 0;
+
+        uint32_t mtest = link_up && !armed && !crash_latch
+                         && (pkt.flags & PKT_MTEST);
+        uint32_t want = (link_up && armed) || mtest;
 
         if (!want) {
             if (motors_live) motors_off();
-        } else {
-            if (!motors_live) motors_engage();
-            motors_set(pkt.throttle);
+        } else if (!motors_live) {
+            motors_engage();
+        }
+
+        if (mtest && motors_live) {
+            /* Single-motor identification: yaw stick picks the pad, the
+             * throttle (capped) spins only that one. Map pads to corners
+             * with this BEFORE trusting the MIX table. */
+            uint32_t idx  = (pkt.yaw >> 6) & 3;
+            uint32_t thr  = pkt.throttle > 64 ? 64 : pkt.throttle;
+            int32_t  duty = (int32_t)((thr * (PWM_ARR + 1)) >> 8);
+            motors_write(idx == 0 ? duty : 0, idx == 1 ? duty : 0,
+                         idx == 2 ? duty : 0, idx == 3 ? duty : 0);
+        }
+
+        /* 200 Hz stabilisation: read the IMU and run the controller. The
+         * same fresh sample feeds the telemetry record. */
+        if (now - last_ctl >= CTL_MS) {
+            last_ctl = now;
+            uint8_t b[14];
+            if (mpu_ok && mpu_burst(0x3B, b, 14)) {
+                int16_t ax = (int16_t)(((uint16_t)b[0]  << 8) | b[1]);
+                int16_t ay = (int16_t)(((uint16_t)b[2]  << 8) | b[3]);
+                int16_t az = (int16_t)(((uint16_t)b[4]  << 8) | b[5]);
+                int16_t gx = (int16_t)(((uint16_t)b[8]  << 8) | b[9]);
+                int16_t gy = (int16_t)(((uint16_t)b[10] << 8) | b[11]);
+                int16_t gz = (int16_t)(((uint16_t)b[12] << 8) | b[13]);
+                /* Runs disarmed too: keeps the attitude estimate warm and
+                 * returns before touching the motors. */
+                flight_step(&pkt, ax, ay, az, gx, gy, gz);
+                tlm.magic = TLM_MAGIC;
+                tlm.seq++;
+                tlm.ax = ax; tlm.ay = ay; tlm.az = az;
+                tlm.gx = gx; tlm.gy = gy; tlm.gz = gz;
+                tlm.flags = TLM_MPU_OK;
+            } else if (!mpu_ok) {
+                tlm.flags = 0;
+            }
         }
 
         /* LED: fast while the link is up, slow when it is not */
@@ -560,30 +743,6 @@ int main(void)
             if (led) pa_hi(PIN_LED); else pa_lo(PIN_LED);
         }
 
-        /* Refresh the queued ack payload. Only one can be pending, so it is
-         * flushed first: a stale reading is worse than a missed one. */
-        if (now - last_tlm >= 20u) {
-            last_tlm = now;
-            uint8_t b[14];
-            tlm.magic = TLM_MAGIC;
-            tlm.seq++;
-            if (mpu_ok && mpu_burst(0x3B, b, 14)) {
-                tlm.ax = (int16_t)(((uint16_t)b[0]  << 8) | b[1]);
-                tlm.ay = (int16_t)(((uint16_t)b[2]  << 8) | b[3]);
-                tlm.az = (int16_t)(((uint16_t)b[4]  << 8) | b[5]);
-                tlm.gx = (int16_t)(((uint16_t)b[8]  << 8) | b[9]);
-                tlm.gy = (int16_t)(((uint16_t)b[10] << 8) | b[11]);
-                tlm.gz = (int16_t)(((uint16_t)b[12] << 8) | b[13]);
-                tlm.flags = TLM_MPU_OK;
-            } else {
-                tlm.flags = 0;
-            }
-            tlm.sum = tlm_sum(&tlm);
-
-            /* No ack payload is queued: this pair will not run auto-ack, and
-             * issuing W_ACK_PAYLOAD with the feature disabled only disturbs the
-             * receiver. Telemetry goes out over the UART instead. */
-        }
 
         if (now - last_report >= 1000) {
             last_report = now;
@@ -607,6 +766,8 @@ int main(void)
             puts_(" thr=");    putdec(pkt.throttle);
             puts_(" link=");   puts_(link_up ? "UP" : "DOWN");
             puts_(" motor=");  puts_(motors_live ? "ON" : "off");
+            puts_(" arm=");    putdec(armed);
+            puts_(" crash="); putdec(crash_latch);
             puts_(" tlm=");    putdec(tlm_sent);
             puts_("/");        putdec(tlm_fail);
             puts_(" ri=");     putdec(reinits);
@@ -619,6 +780,16 @@ int main(void)
          * precision to spend on the arctangent anyway. 10 Hz keeps the
          * attitude display fluid while filling under half of the 9600-baud
          * line; the radio FIFO is 3 deep, enough to ride out each print. */
+        if (now - last_att >= 200u) {
+            last_att = now;
+            /* fused attitude in centi-degrees: fp/262 done as (fp*250)>>16 */
+            puts_("ATT ");
+            putsig((int16_t)((roll_fp  / 4 * 250) >> 14));
+            putc_(' ');
+            putsig((int16_t)((pitch_fp / 4 * 250) >> 14));
+            puts_("\r\n");
+        }
+
         if (now - last_imu >= 100u) {
             last_imu = now;
             puts_("IMU ");

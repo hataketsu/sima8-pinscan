@@ -18,6 +18,7 @@
 
 #define PKT_MAGIC    0xA5
 #define PKT_ARM      0x01         /* flags bit 0 */
+#define PKT_MTEST    0x02         /* flags bit 1: single-motor test, only while disarmed */
 
 #define TX_PERIOD_MS   20         /* 50 Hz */
 #define FAILSAFE_MS   300         /* motors cut after this long with no packet */

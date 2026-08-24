@@ -467,7 +467,14 @@ int main(void)
                         if (pkt.throttle == 0) { pkt.flags |= PKT_ARM; puts_("ARMED\r\n"); }
                         else puts_("tu choi: ha throttle ve 0 truoc\r\n");
                         break;
-                    case 'd': pkt.flags &= (uint8_t)~PKT_ARM; pkt.throttle = 0; puts_("DISARMED\r\n"); break;
+                    case 'd': pkt.flags &= (uint8_t)~(PKT_ARM | PKT_MTEST); pkt.throttle = 0; puts_("DISARMED\r\n"); break;
+                    case 'm':
+                        /* single-motor test mode; y 0/64/128/192 picks the
+                         * motor, throttle (capped by the drone) spins it */
+                        if (pkt.flags & PKT_ARM) { puts_("dang arm, khong test duoc\r\n"); break; }
+                        pkt.flags ^= PKT_MTEST;
+                        puts_((pkt.flags & PKT_MTEST) ? "MTEST on\r\n" : "MTEST off\r\n");
+                        break;
                     case 's': puts_("status theo dong bao cao moi giay\r\n"); break;
                     /* Continuous carrier. Decides whether this radio puts any
                      * energy on air at all, independent of address, CRC or
