@@ -9,8 +9,8 @@ LDFLAGS = -T stm32f103.ld -nostdlib -Wl,--gc-sections -Wl,-Map=ground.map
 
 all: ground.bin
 
-ground.elf: main.c ../common/start.c ../common/protocol.h stm32f103.ld
-	$(CC) $(CFLAGS) $(LDFLAGS) main.c ../common/start.c -o $@
+ground.elf: main.c usb_cdc.c usb_cdc.h ../common/start.c ../common/protocol.h stm32f103.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) main.c usb_cdc.c ../common/start.c -o $@
 	$(SZ) $@
 
 ground.bin: ground.elf

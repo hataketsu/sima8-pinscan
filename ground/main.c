@@ -12,6 +12,7 @@
  */
 #include <stdint.h>
 #include "../common/protocol.h"
+#include "usb_cdc.h"
 
 #define F_CPU   72000000u          /* HSE 8 MHz through PLL x9 */
 #define F_PCLK2 72000000u          /* APB2 undivided, feeds USART1 */
@@ -123,10 +124,16 @@ static int uart_getc(void)               /* -1 when nothing is waiting */
     if (!(USART1_SR & (1u << 5))) return -1;   /* RXNE */
     return (int)(USART1_DR & 0xFF);
 }
+static int cmd_getc(void)                /* UART first, then USB */
+{
+    int c = uart_getc();
+    return (c >= 0) ? c : usb_cdc_getc();
+}
 static void putc_(char c)
 {
     while (!(USART1_SR & (1u << 7))) { }   /* TXE */
     USART1_DR = (uint8_t)c;
+    usb_cdc_putc(c);                       /* same text out both links */
 }
 static void puts_(const char *s) { while (*s) putc_(*s++); }
 static void puthex(uint8_t v)
@@ -296,6 +303,7 @@ int main(void)
     stk_last = STK_VAL;
 
     uart_init();
+    usb_cdc_init();
     spi_init();
 
     puts_("\r\nsima8 ground tx\r\n");
@@ -324,8 +332,18 @@ int main(void)
     for (;;) {
         uint32_t now = millis();
 
+        usb_cdc_poll();
+
+        /* A 1200-baud open is how hosts ask for the bootloader; honour it the
+         * same way the 'b' command does. */
+        if (usb_cdc_reboot_request) {
+            usb_cdc_reboot_request = 0;
+            for (volatile int k = 0; k < 400000; k++) { usb_cdc_poll(); }
+            reboot_to_bootloader();
+        }
+
         /* command input, one line at a time */
-        int ch = uart_getc();
+        int ch = cmd_getc();
         if (ch >= 0) {
             if (ch == '\r' || ch == '\n') {
                 line[li] = 0;
