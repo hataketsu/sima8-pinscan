@@ -321,7 +321,19 @@ static uint32_t mpu_begin(void)
     RCC_AHBENR |= IOPBEN;
     pb_in(SCL); pb_in(SDA);
     delay_ms(2);
-    if (!mpu_wr(0x6B, 0x01)) return 0;   /* leave sleep, clock off the X gyro */
+    /* Bus recovery: an MCU reset mid-transaction can leave the MPU6050
+     * holding SDA low. Nine clock pulses and a STOP release it. */
+    for (uint32_t i = 0; i < 9; i++) {
+        pb_low(SCL); ib_dly(I2C_HALF);
+        pb_in(SCL);  ib_dly(I2C_HALF);
+    }
+    i2c_stop();
+    uint32_t up = 0;
+    for (uint32_t i = 0; i < 5 && !up; i++) {   /* retry: sensor may still be waking */
+        up = mpu_wr(0x6B, 0x01);                /* leave sleep, clock off the X gyro */
+        if (!up) delay_ms(20);
+    }
+    if (!up) return 0;
     delay_ms(20);
     mpu_wr(0x1B, 0x00);                  /* gyro  +-250 dps */
     mpu_wr(0x1C, 0x00);                  /* accel +-2 g     */
@@ -383,13 +395,22 @@ static uint8_t dbg_cfg, dbg_st, dbg_fifo;
  * Costs a few ms of deafness per burst. Returns 1 on TX_DS. */
 static uint32_t rf_send_tlm(const tlm_t *t)
 {
+    /* Give the ground unit time to finish its own PWR_UP bounce into RX;
+     * bursting immediately would land while its radio is still waking. */
+    delay_ms(4);
+
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO);                 /* power down  */
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);    /* wake into TX */
+    delay_ms(3);                                              /* PLL settle   */
+
+    /* Payload written only once the chip is awake in TX mode — the exact
+     * sequence REVERSE_TEST proved over the air. Writing it before the
+     * power-down bounce made TX_DS assert but nothing valid left the
+     * antenna, so the FIFO does not reliably survive power-down here. */
     pa_lo(PIN_CSN);
     spi_xfer(CMD_W_TX_PAYLOAD);
     for (uint32_t i = 0; i < TLM_LEN; i++) spi_xfer(((const uint8_t *)t)[i]);
     pa_hi(PIN_CSN);
-
-    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO);                 /* power down  */
-    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);    /* wake into TX */
 
     uint32_t ok = 0, t0 = millis();
     while (millis() - t0 < 8u) {
@@ -452,8 +473,18 @@ int main(void)
 
     puts_("\r\nsima8 drone rx\r\n");
     uint8_t cfg_check = rf_rd(REG_CONFIG);
-    rf_init_rx();
-    rf_init_rx();
+    /* The radio powers up more slowly than the MCU: straight after battery
+     * plug-in, writes are silently ignored and every register reads its
+     * power-on default (RF_CH=2, RX_ADDR_P0=0xE7..., CONFIG=0x08). That is
+     * why the link historically only came up on some power-ups. Configure,
+     * read back, and retry until the settings actually stick. */
+    delay_ms(50);
+    for (uint32_t i = 0; i < 100; i++) {
+        rf_init_rx();
+        if (rf_rd(REG_RF_CH) == RF_CHANNEL && rf_rd(REG_RX_PW_P0) == RF_PAYLOAD)
+            break;
+        delay_ms(20);
+    }
     puts_("CONFIG before=0x"); puthex(cfg_check);
     puts_(" after=0x"); puthex(rf_rd(REG_CONFIG));
     puts_(" RF_CH="); putdec(rf_rd(REG_RF_CH));
@@ -463,7 +494,7 @@ int main(void)
     uint32_t good = 0, bad = 0;
     tlm_t tlm = { TLM_MAGIC, 0, 0,0,0, 0,0,0, 0, 0 };
     uint32_t last_tlm = 0, last_imu = 0;
-    uint32_t tlm_due = 0, tlm_sent = 0, tlm_fail = 0;
+    uint32_t tlm_due = 0, tlm_sent = 0, tlm_fail = 0, reinits = 0;
     uint32_t mpu_ok = mpu_begin();
     /* Received Power Detector: set while incoming power is above about
      * -64 dBm. Sampling it separates "no RF is arriving at all" from "RF
@@ -556,6 +587,9 @@ int main(void)
 
         if (now - last_report >= 1000) {
             last_report = now;
+            /* Self-heal: if the radio lost or never took its configuration
+             * (brown-out, slow power-up), put it back and say so. */
+            if (rf_rd(REG_RF_CH) != RF_CHANNEL) { rf_init_rx(); reinits++; }
             /* Both ends claim to be configured, so print what the radio
              * actually holds and compare the two sides directly. */
             puts_("ch=");     putdec(rf_rd(REG_RF_CH));
@@ -575,6 +609,7 @@ int main(void)
             puts_(" motor=");  puts_(motors_live ? "ON" : "off");
             puts_(" tlm=");    putdec(tlm_sent);
             puts_("/");        putdec(tlm_fail);
+            puts_(" ri=");     putdec(reinits);
             puts_(" dbg=");    puthex(dbg_cfg); puthex(dbg_st); puthex(dbg_fifo);
             puts_("\r\n");
         }

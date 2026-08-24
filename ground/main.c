@@ -148,6 +148,11 @@ static void putdec(uint32_t v)
     while (v) { uint32_t q = 0; while (v >= 10) { v -= 10; q++; } b[i++] = (char)('0' + v); v = q; }
     while (i--) putc_(b[i]);
 }
+static void putsig(int16_t v)
+{
+    if (v < 0) { putc_('-'); putdec((uint32_t)(-(int32_t)v)); }
+    else putdec((uint32_t)v);
+}
 
 /* ---- SPI1 ---- */
 static void spi_init(void)
@@ -233,13 +238,35 @@ static void rf_init_tx(void)
     rf_wr(REG_RF_SETUP,   0x06);
     rf_wr_buf(REG_TX_ADDR,     addr, RF_ADDR_LEN);
     rf_wr_buf(REG_RX_ADDR_P0,  addr, RF_ADDR_LEN);
-    rf_wr(REG_RX_PW_P0, RF_PAYLOAD);
+    rf_wr(REG_RX_PW_P0, TLM_LEN);   /* the only thing received here is telemetry */
     rf_cmd(CMD_FLUSH_RX);
     rf_cmd(CMD_FLUSH_TX);
     rf_wr(REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
 }
 
 /* Returns 1 if the radio reported the packet went out. */
+/* Between control packets the ground unit turns around and listens for the
+ * drone's telemetry burst. CE is a real pin here, so this is the documented
+ * dance: CE low into Standby-I, flip PRIM_RX, CE back high. */
+static void rf_listen(void)
+{
+    gp_lo(GPIOB, PIN_CE);
+    /* This module is a clone too (it refused EN_ACK_PAY), and like the
+     * drone's BK2425 it only samples PRIM_RX on the way out of power-down:
+     * with a plain CONFIG flip it kept transmitting fine but never heard a
+     * single telemetry burst. Bounce PWR_UP so the mode change takes. */
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO);
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP | CFG_PRIM_RX);
+    gp_hi(GPIOB, PIN_CE);
+}
+static void rf_hangup(void)
+{
+    gp_lo(GPIOB, PIN_CE);
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO);
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);
+    delay_ms(3);        /* crystal restart before rf_send pulses CE */
+}
+
 static uint32_t rf_send(const pkt_t *p)
 {
     gp_lo(GPIOA, PIN_CSN);
@@ -402,6 +429,8 @@ int main(void)
 
     pkt_t pkt = { PKT_MAGIC, 0, 0, 128, 128, 128, 0, 0 };
     uint32_t sent = 0, failed = 0, rpd_hits = 0;
+    tlm_t tlm = {0,0,0,0,0,0,0,0,0,0};
+    uint32_t tlm_good = 0, tlm_bad = 0, last_tlm_ms = 0;
     uint32_t last_tx = millis(), last_report = last_tx;
 
     for (;;) {
@@ -487,9 +516,42 @@ int main(void)
 #else
         if (now - last_tx >= TX_PERIOD_MS) {
             last_tx = now;
+            rf_hangup();
             pkt.seq++;
             pkt.sum = pkt_sum(&pkt);
             if (rf_send(&pkt)) sent++; else failed++;
+            rf_listen();
+        }
+
+        /* Raw carrier sniff while listening: RPD (reg 0x09 bit 0) sets on any
+         * >-64 dBm energy on the channel, address and CRC be damned. Separates
+         * "the burst never arrives" from "it arrives and is rejected". */
+        if (rf_rd(0x09) & 1u) rpd_hits++;
+
+        /* Telemetry arriving in the listening window between control packets */
+        if (rf_rd(REG_STATUS) & ST_RX_DR) {
+            tlm_t in;
+            gp_lo(GPIOA, PIN_CSN);
+            spi_xfer(CMD_R_RX_PAYLOAD);
+            for (uint32_t i = 0; i < TLM_LEN; i++) ((uint8_t *)&in)[i] = spi_xfer(CMD_NOP);
+            gp_hi(GPIOA, PIN_CSN);
+            rf_wr(REG_STATUS, ST_RX_DR);
+            if (tlm_valid(&in)) {
+                tlm = in;
+                tlm_good++;
+                last_tlm_ms = now;
+                puts_("TLM ");
+                puts_((tlm.flags & TLM_MPU_OK) ? "ok " : "mat ");
+                putsig(tlm.ax); putc_(' ');
+                putsig(tlm.ay); putc_(' ');
+                putsig(tlm.az); putc_(' ');
+                putsig(tlm.gx); putc_(' ');
+                putsig(tlm.gy); putc_(' ');
+                putsig(tlm.gz);
+                puts_("\r\n");
+            } else {
+                tlm_bad++;
+            }
         }
 #endif
 
@@ -518,6 +580,9 @@ int main(void)
             puts_(" CONFIG=0x");puthex(cf);
             puts_(" STATUS=0x");puthex(st);
             puts_(" FIFO=0x");  puthex(fs);
+            puts_(" tlm=");     putdec(tlm_good);
+            puts_("/");         putdec(tlm_bad);
+            puts_(now - last_tlm_ms < 1000 ? " rf-tlm=UP" : " rf-tlm=DOWN");
             puts_(a0 == 0x00 || a0 == 0xFF ? "  <- khong thay radio\r\n" : "\r\n");
         }
     }
