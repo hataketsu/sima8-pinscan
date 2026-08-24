@@ -251,11 +251,18 @@ static void rf_rx_payload(uint8_t *b, uint32_t n)
     pa_hi(PIN_CSN);
 }
 
+/* Matches REVERSE_TEST on the ground unit: this end transmits instead. */
+#define REVERSE_TEST 0
+
 static void rf_init_rx(void)
 {
     static const uint8_t addr[RF_ADDR_LEN] = RF_ADDR;
 
+#if REVERSE_TEST
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);
+#else
     rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP | CFG_PRIM_RX);
+#endif
     delay_ms(5);                        /* power-up settling */
     rf_wr(REG_EN_AA,      0x00);        /* no auto-ack, matching the ground unit */
     rf_wr(REG_EN_RXADDR,  0x01);        /* pipe 0 only */
@@ -264,10 +271,13 @@ static void rf_init_rx(void)
     rf_wr(REG_RF_CH,      RF_CHANNEL);
     rf_wr(REG_RF_SETUP,   0x06);        /* 1 Mbps, 0 dBm */
     rf_wr_buf(REG_RX_ADDR_P0, addr, RF_ADDR_LEN);
+    rf_wr_buf(REG_TX_ADDR,    addr, RF_ADDR_LEN);
     rf_wr(REG_RX_PW_P0,   RF_PAYLOAD);
     rf_cmd(CMD_FLUSH_RX);
     rf_wr(REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
 }
+
+
 
 int main(void)
 {
@@ -287,6 +297,7 @@ int main(void)
     puts_("\r\nsima8 drone rx\r\n");
     uint8_t cfg_check = rf_rd(REG_CONFIG);
     rf_init_rx();
+    rf_init_rx();
     puts_("CONFIG before=0x"); puthex(cfg_check);
     puts_(" after=0x"); puthex(rf_rd(REG_CONFIG));
     puts_(" RF_CH="); putdec(rf_rd(REG_RF_CH));
@@ -294,12 +305,29 @@ int main(void)
 
     pkt_t pkt;
     uint32_t good = 0, bad = 0;
+    /* Received Power Detector: set while incoming power is above about
+     * -64 dBm. Sampling it separates "no RF is arriving at all" from "RF
+     * arrives but the packets are being rejected". */
     uint32_t last_pkt = millis(), last_report = last_pkt, last_led = last_pkt;
     uint32_t led = 0;
 
     for (;;) {
         uint32_t now = millis();
 
+#if REVERSE_TEST
+        /* CE is strapped high here, so a payload write transmits immediately */
+        if (now - last_report_tx >= 20u) {
+            last_report_tx = now;
+            pkt_t out = { PKT_MAGIC, (uint8_t)good, 0, 128, 128, 128, 0, 0 };
+            out.sum = pkt_sum(&out);
+            pa_lo(PIN_CSN);
+            spi_xfer(CMD_W_TX_PAYLOAD);
+            for (uint32_t i = 0; i < RF_PAYLOAD; i++) spi_xfer(((uint8_t *)&out)[i]);
+            pa_hi(PIN_CSN);
+            good++;
+            rf_wr(REG_STATUS, ST_TX_DS | ST_MAX_RT);
+        }
+#endif
         if (rf_rd(REG_STATUS) & ST_RX_DR) {
             rf_rx_payload((uint8_t *)&pkt, RF_PAYLOAD);
             rf_wr(REG_STATUS, ST_RX_DR);
@@ -327,6 +355,18 @@ int main(void)
 
         if (now - last_report >= 1000) {
             last_report = now;
+            /* Both ends claim to be configured, so print what the radio
+             * actually holds and compare the two sides directly. */
+            puts_("ch=");     putdec(rf_rd(REG_RF_CH));
+            puts_(" a0=0x");  puthex(rf_rd(REG_RX_ADDR_P0));
+            puts_(" cfg=0x"); puthex(rf_rd(REG_CONFIG));
+            puts_(" st=0x");  puthex(rf_rd(REG_STATUS));
+            puts_(" fifo=0x");puthex(rf_rd(REG_FIFO_STATUS));
+            puts_(" en_rx=0x"); puthex(rf_rd(REG_EN_RXADDR));
+            puts_(" aw=0x");  puthex(rf_rd(REG_SETUP_AW));
+            puts_(" pw=");    putdec(rf_rd(REG_RX_PW_P0));
+            puts_(" rf=0x");  puthex(rf_rd(REG_RF_SETUP));
+            puts_("\r\n");
             puts_("rx good="); putdec(good);
             puts_(" bad=");    putdec(bad);
             puts_(" thr=");    putdec(pkt.throttle);

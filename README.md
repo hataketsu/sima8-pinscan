@@ -88,6 +88,45 @@ Both facts simplify the driver: no CE strobe to sequence, no interrupt line to
 service. Mode switching happens through the PRIM_RX bit in CONFIG, which works
 because CE is permanently asserted.
 
+## The radio latches, and only a power cycle clears it
+
+This cost more time than anything else, so it is worth stating plainly.
+
+`CE` on the drone's BK2425 is tied high on the board. No MCU pin controls it,
+which means the radio can never be put into standby. The datasheet wants `CE`
+low before `PRIM_RX` is changed, and with the pin strapped there is no way to
+comply: switching between transmit and receive happens while the radio is live.
+Do that and the part stops working — SPI still answers, every register reads
+back exactly what was written, the chip id still reads `0x63`, and nothing goes
+out or comes in. An MCU reset does not help, because the BK2425 has no reset
+line and keeps its state across them. Only removing power recovers it.
+
+That is why the link kept appearing to die: each mode change stuck the radio,
+and each round of debugging reset only the MCU.
+
+Practical consequences:
+
+- Set `PRIM_RX` once, at power-up, and leave it alone. This firmware is receive
+  only for that reason.
+- When the radio stops responding on air but still answers over SPI, power-cycle
+  the board before changing anything in software.
+
+### The CE conclusion was wrong the first two times
+
+Worth recording because the failure mode is instructive. The first sweep pulsed
+each pin and watched for `TX_DS`, concluded `PA0` was `CE`, and was wrong: a
+control trial with no pin pulsed set `TX_DS` just the same. The test had no
+negative baseline, so every pin looked positive.
+
+The second sweep had a negative baseline — a full TX FIFO that would not drain —
+and reported that no pin was `CE`. That was also worthless: the radio was in the
+latched state, so nothing could have made it transmit, and a test that cannot
+produce a positive cannot rule anything out.
+
+The third sweep ran against a live link with packets arriving, pulled each pin
+low, and looked for the flow to stop. Nothing stopped it, and the link was still
+up afterwards. Same conclusion as the second sweep, but this time supported.
+
 ## Sensor check
 
 Phase 6 streams live MPU6050 samples so a host can tell a working sensor from

@@ -206,20 +206,35 @@ static void rf_wr_buf(uint8_t reg, const uint8_t *b, uint32_t n)
     gp_hi(GPIOA, PIN_CSN);
 }
 
+/* Direction test: transmitting is what draws peak current, receiving does not.
+ * If the link comes alive with the roles swapped, the fault is specifically
+ * this board's transmit path, which is what a sagging supply would produce.
+ * Set to 0 for the normal control direction. */
+#define REVERSE_TEST 0
+
 static void rf_init_tx(void)
 {
     static const uint8_t addr[RF_ADDR_LEN] = RF_ADDR;
 
+#if REVERSE_TEST
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP | CFG_PRIM_RX);
+#else
     rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);   /* PRIM_RX clear */
+#endif
     delay_ms(5);
     rf_wr(REG_EN_AA,      0x00);
     rf_wr(REG_EN_RXADDR,  0x01);
     rf_wr(REG_SETUP_AW,   0x03);
     rf_wr(REG_SETUP_RETR, 0x00);
     rf_wr(REG_RF_CH,      RF_CHANNEL);
+    /* Minimum power, 1 Mbps. Two modules sitting a few centimetres apart at
+     * full power can desensitise the receiver, which looks exactly like a dead
+     * link: the transmitter reports success and the receiver hears nothing. */
     rf_wr(REG_RF_SETUP,   0x06);
     rf_wr_buf(REG_TX_ADDR,     addr, RF_ADDR_LEN);
     rf_wr_buf(REG_RX_ADDR_P0,  addr, RF_ADDR_LEN);
+    rf_wr(REG_RX_PW_P0, RF_PAYLOAD);
+    rf_cmd(CMD_FLUSH_RX);
     rf_cmd(CMD_FLUSH_TX);
     rf_wr(REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
 }
@@ -290,8 +305,68 @@ static void clock_init_hse72(void)
 #define SCB_VTOR (*(volatile uint32_t *)0xE000ED08u)
 #define APP_BASE 0x08000800u   /* HID bootloader reserves the first 2 KB */
 
+/* Twenty seconds at 8 MHz before the normal 72 MHz startup.
+ *
+ * The link was seen working from this board when it ran at 8 MHz with no USB.
+ * Raising the clock and adding USB is the only change on the transmit path
+ * since. This reproduces the old conditions briefly and then restores the
+ * normal ones, so the board is never stranded without its USB console. The
+ * result is read on the drone's UART, not here. */
+static void hsi8_burst(void)
+{
+    static const uint8_t addr[RF_ADDR_LEN] = RF_ADDR;
+
+    RCC_CR |= (1u << 0);
+    while (!(RCC_CR & (1u << 1))) { }
+    RCC_CFGR &= ~3u;                       /* SW = HSI, 8 MHz */
+    while ((RCC_CFGR & (3u << 2)) != 0) { }
+    RCC_CR &= ~(1u << 24);                 /* PLL off, safe now that HSI drives the core */
+
+    RCC_APB2ENR |= IOPAEN | IOPBEN | AFIOEN | SPI1EN;
+    cfg_pin(GPIOA, PIN_CSN, CNF_OUT_PP);
+    cfg_pin(GPIOA, 5, CNF_AF_PP);
+    cfg_pin(GPIOA, 6, CNF_IN_FLOAT);
+    cfg_pin(GPIOA, 7, CNF_AF_PP);
+    cfg_pin(GPIOB, PIN_CE, CNF_OUT_PP);
+    gp_hi(GPIOA, PIN_CSN);
+    gp_lo(GPIOB, PIN_CE);
+    SPI1_CR1 = (1u << 2) | (2u << 3) | (1u << 9) | (1u << 8) | (1u << 6);  /* /8 -> 1 MHz */
+
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);
+    for (volatile uint32_t i = 0; i < 40000u; i++) { }
+    rf_wr(REG_EN_AA,      0x00);
+    rf_wr(REG_EN_RXADDR,  0x01);
+    rf_wr(REG_SETUP_AW,   0x03);
+    rf_wr(REG_SETUP_RETR, 0x00);
+    rf_wr(REG_RF_CH,      RF_CHANNEL);
+    rf_wr(REG_RF_SETUP,   0x06);
+    rf_wr_buf(REG_TX_ADDR,    addr, RF_ADDR_LEN);
+    rf_wr_buf(REG_RX_ADDR_P0, addr, RF_ADDR_LEN);
+    rf_cmd(CMD_FLUSH_TX);
+    rf_wr(REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
+
+    pkt_t p = { PKT_MAGIC, 0, 0, 128, 128, 128, 0, 0 };
+    for (uint32_t n = 0; n < 1000u; n++) {          /* roughly 20 s */
+        p.seq++;
+        p.sum = pkt_sum(&p);
+        gp_lo(GPIOA, PIN_CSN);
+        spi_xfer(CMD_W_TX_PAYLOAD);
+        for (uint32_t i = 0; i < RF_PAYLOAD; i++) spi_xfer(((const uint8_t *)&p)[i]);
+        gp_hi(GPIOA, PIN_CSN);
+
+        gp_hi(GPIOB, PIN_CE);
+        for (volatile uint32_t i = 0; i < 40u; i++) { }
+        gp_lo(GPIOB, PIN_CE);
+
+        for (volatile uint32_t i = 0; i < 12000u; i++) { }
+        rf_wr(REG_STATUS, ST_TX_DS | ST_MAX_RT);
+    }
+}
+
 int main(void)
 {
+    hsi8_burst();
+
     /* The bootloader left its own vector table active. Point the core at ours;
      * this build polls rather than using interrupts, but leaving VTOR stale is
      * a trap for the first interrupt anyone adds later. */
@@ -326,7 +401,7 @@ int main(void)
     uint32_t li = 0;
 
     pkt_t pkt = { PKT_MAGIC, 0, 0, 128, 128, 128, 0, 0 };
-    uint32_t sent = 0, failed = 0;
+    uint32_t sent = 0, failed = 0, rpd_hits = 0;
     uint32_t last_tx = millis(), last_report = last_tx;
 
     for (;;) {
@@ -365,6 +440,20 @@ int main(void)
                         break;
                     case 'd': pkt.flags &= (uint8_t)~PKT_ARM; pkt.throttle = 0; puts_("DISARMED\r\n"); break;
                     case 's': puts_("status theo dong bao cao moi giay\r\n"); break;
+                    /* Continuous carrier. Decides whether this radio puts any
+                     * energy on air at all, independent of address, CRC or
+                     * payload — things TX_DS cannot tell us. */
+                    case 'w':
+                        rf_wr(REG_RF_SETUP, 0x96);   /* CONT_WAVE | PLL_LOCK | 1 Mbps */
+                        rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);
+                        gp_hi(GPIOB, PIN_CE);
+                        puts_("song mang LIEN TUC bat\r\n");
+                        break;
+                    case 'n':
+                        gp_lo(GPIOB, PIN_CE);
+                        rf_wr(REG_RF_SETUP, 0x06);
+                        puts_("song mang tat\r\n");
+                        break;
                     case 'b': puts_("vao bootloader...\r\n"); for (volatile int k = 0; k < 200000; k++) { } reboot_to_bootloader(); break;
                     default:  puts_("lenh la\r\n"); break;
                     }
@@ -381,12 +470,28 @@ int main(void)
             if (led_on) gp_lo(GPIOC, PIN_LED); else gp_hi(GPIOC, PIN_LED);
         }
 
+#if REVERSE_TEST
+        /* CE is held high for RX and the drone does the transmitting */
+        gp_hi(GPIOB, PIN_CE);
+        if (rf_rd(0x09) & 1u) rpd_hits++;
+        if (rf_rd(REG_STATUS) & ST_RX_DR) {
+            pkt_t in;
+            gp_lo(GPIOA, PIN_CSN);
+            spi_xfer(CMD_R_RX_PAYLOAD);
+            for (uint32_t i = 0; i < RF_PAYLOAD; i++) ((uint8_t *)&in)[i] = spi_xfer(CMD_NOP);
+            gp_hi(GPIOA, PIN_CSN);
+            rf_wr(REG_STATUS, ST_RX_DR);
+            if (pkt_valid(&in)) sent++; else failed++;
+        }
+        (void)last_tx;
+#else
         if (now - last_tx >= TX_PERIOD_MS) {
             last_tx = now;
             pkt.seq++;
             pkt.sum = pkt_sum(&pkt);
             if (rf_send(&pkt)) sent++; else failed++;
         }
+#endif
 
         if (now - last_report >= 1000) {
             last_report = now;
@@ -398,7 +503,16 @@ int main(void)
             uint8_t cf = rf_rd(REG_CONFIG);
             uint8_t st = rf_rd(REG_STATUS);
             uint8_t fs = rf_rd(REG_FIFO_STATUS);
-            puts_("tx sent="); putdec(sent);
+            puts_("rpd=");     putdec(rpd_hits); rpd_hits = 0;
+            puts_(" ch=");     putdec(rf_rd(REG_RF_CH));
+            puts_(" a0=0x");   puthex(rf_rd(REG_RX_ADDR_P0));
+            puts_(" tx0=0x");  puthex(rf_rd(REG_TX_ADDR));
+            puts_(" aw=0x");   puthex(rf_rd(REG_SETUP_AW));
+            puts_(" rf=0x");   puthex(rf_rd(REG_RF_SETUP));
+            puts_(" retr=0x"); puthex(rf_rd(REG_SETUP_RETR));
+            puts_(" aa=0x");   puthex(rf_rd(REG_EN_AA));
+            puts_("\r\n");
+            puts_("rx good="); putdec(sent);
             puts_(" failed=");  putdec(failed);
             puts_(" ADDR0=0x"); puthex(a0);
             puts_(" CONFIG=0x");puthex(cf);

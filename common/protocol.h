@@ -11,7 +11,7 @@
 
 #include <stdint.h>
 
-#define RF_CHANNEL   76           /* 2476 MHz, above the busiest WiFi channels */
+#define RF_CHANNEL   76           /* the channel the link was first seen working on */
 #define RF_ADDR_LEN  5
 #define RF_PAYLOAD   8
 #define RF_ADDR      { 'S', 'I', 'M', 'A', '8' }
