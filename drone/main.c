@@ -329,6 +329,7 @@ static uint32_t mpu_begin(void)
     return 1;
 }
 
+
 /* ---- radio ---- */
 static uint8_t rf_cmd(uint8_t cmd)
 {
@@ -366,6 +367,44 @@ static void rf_rx_payload(uint8_t *b, uint32_t n)
     for (uint32_t i = 0; i < n; i++) b[i] = spi_xfer(CMD_NOP);
     pa_hi(PIN_CSN);
 }
+
+static uint8_t dbg_cfg, dbg_st, dbg_fifo;
+
+/* Half-duplex telemetry burst.
+ *
+ * CE is strapped high, so the mode can never be changed the documented way.
+ * Writing PRIM_RX on the live chip updates the register but not the state
+ * machine: with CONFIG reading 0x0E (TX) the chip demonstrably kept
+ * receiving (RX_DR kept setting) and the queued payload sat in the TX FIFO.
+ * The state machine only samples PRIM_RX when it leaves power-down, so the
+ * mode is changed by bouncing PWR_UP: power down, wake straight into TX
+ * (CE already high and the FIFO survives power-down, so the payload leaves
+ * as soon as the radio settles), then bounce again to wake back into RX.
+ * Costs a few ms of deafness per burst. Returns 1 on TX_DS. */
+static uint32_t rf_send_tlm(const tlm_t *t)
+{
+    pa_lo(PIN_CSN);
+    spi_xfer(CMD_W_TX_PAYLOAD);
+    for (uint32_t i = 0; i < TLM_LEN; i++) spi_xfer(((const uint8_t *)t)[i]);
+    pa_hi(PIN_CSN);
+
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO);                 /* power down  */
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);    /* wake into TX */
+
+    uint32_t ok = 0, t0 = millis();
+    while (millis() - t0 < 8u) {
+        if (rf_rd(REG_STATUS) & ST_TX_DS) { ok = 1; break; }
+    }
+    if (!ok) { dbg_cfg = rf_rd(REG_CONFIG); dbg_st = rf_rd(REG_STATUS);
+               dbg_fifo = rf_rd(REG_FIFO_STATUS); }
+    rf_wr(REG_STATUS, ST_TX_DS | ST_MAX_RT);
+    if (!ok) rf_cmd(CMD_FLUSH_TX);
+
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO);                 /* power down  */
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP | CFG_PRIM_RX); /* RX */
+    return ok;
+}
+
 
 /* Matches REVERSE_TEST on the ground unit: this end transmits instead. */
 #define REVERSE_TEST 0
@@ -424,6 +463,7 @@ int main(void)
     uint32_t good = 0, bad = 0;
     tlm_t tlm = { TLM_MAGIC, 0, 0,0,0, 0,0,0, 0, 0 };
     uint32_t last_tlm = 0, last_imu = 0;
+    uint32_t tlm_due = 0, tlm_sent = 0, tlm_fail = 0;
     uint32_t mpu_ok = mpu_begin();
     /* Received Power Detector: set while incoming power is above about
      * -64 dBm. Sampling it separates "no RF is arriving at all" from "RF
@@ -457,8 +497,18 @@ int main(void)
         while (!(rf_rd(REG_FIFO_STATUS) & 0x01)) {
             rf_rx_payload((uint8_t *)&pkt, RF_PAYLOAD);
             rf_wr(REG_STATUS, ST_RX_DR);
-            if (pkt_valid(&pkt)) { good++; last_pkt = now; }
+            if (pkt_valid(&pkt)) { good++; last_pkt = now; tlm_due++; }
             else                 { bad++; }
+        }
+
+        /* Answer every 5th control packet with a telemetry burst (~8 Hz).
+         * Sending right after a reception lands inside the ground unit's
+         * listening window, and only ever transmitting immediately after a
+         * good packet guarantees the ground's own transmitter is idle. */
+        if (tlm_due >= 5) {
+            tlm_due = 0;
+            tlm.sum = tlm_sum(&tlm);
+            if (rf_send_tlm(&tlm)) tlm_sent++; else tlm_fail++;
         }
 
         uint32_t link_up = (now - last_pkt < FAILSAFE_MS);
@@ -523,6 +573,9 @@ int main(void)
             puts_(" thr=");    putdec(pkt.throttle);
             puts_(" link=");   puts_(link_up ? "UP" : "DOWN");
             puts_(" motor=");  puts_(motors_live ? "ON" : "off");
+            puts_(" tlm=");    putdec(tlm_sent);
+            puts_("/");        putdec(tlm_fail);
+            puts_(" dbg=");    puthex(dbg_cfg); puthex(dbg_st); puthex(dbg_fifo);
             puts_("\r\n");
         }
 
