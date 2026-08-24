@@ -222,9 +222,6 @@ static void rf_init_tx(void)
     rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);   /* PRIM_RX clear */
 #endif
     delay_ms(5);
-    /* Auto-ack carries the drone's telemetry back inside the acknowledgement,
-     * so neither end ever changes direction. Retries also give an honest
-     * delivery figure, which TX_DS alone cannot provide. */
     rf_wr(REG_EN_AA,      0x00);
     rf_wr(REG_EN_RXADDR,  0x01);
     rf_wr(REG_SETUP_AW,   0x03);
@@ -237,18 +234,10 @@ static void rf_init_tx(void)
     rf_wr_buf(REG_TX_ADDR,     addr, RF_ADDR_LEN);
     rf_wr_buf(REG_RX_ADDR_P0,  addr, RF_ADDR_LEN);
     rf_wr(REG_RX_PW_P0, RF_PAYLOAD);
-    if (rf_rd(REG_FEATURE) == 0) {
-        gp_lo(GPIOA, PIN_CSN); spi_xfer(CMD_ACTIVATE); spi_xfer(0x73); gp_hi(GPIOA, PIN_CSN);
-    }
-    rf_wr(REG_FEATURE, 0x00);
-    rf_wr(REG_DYNPD,   0x00);
     rf_cmd(CMD_FLUSH_RX);
     rf_cmd(CMD_FLUSH_TX);
     rf_wr(REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
 }
-
-static tlm_t g_tlm;
-static uint32_t g_tlm_n;
 
 /* Returns 1 if the radio reported the packet went out. */
 static uint32_t rf_send(const pkt_t *p)
@@ -265,28 +254,7 @@ static uint32_t rf_send(const pkt_t *p)
 
     for (uint32_t i = 0; i < 1000; i++) {
         uint8_t st = rf_rd(REG_STATUS);
-        if (st & ST_TX_DS) {
-            rf_wr(REG_STATUS, ST_TX_DS);
-            /* An ack payload arrives with the acknowledgement, not separately */
-            if (st & ST_RX_DR) {
-                gp_lo(GPIOA, PIN_CSN);
-                spi_xfer(CMD_R_RX_PL_WID);
-                uint8_t w = spi_xfer(CMD_NOP);
-                gp_hi(GPIOA, PIN_CSN);
-                if (w == TLM_LEN) {
-                    tlm_t t;
-                    gp_lo(GPIOA, PIN_CSN);
-                    spi_xfer(CMD_R_RX_PAYLOAD);
-                    for (uint32_t k = 0; k < TLM_LEN; k++) ((uint8_t *)&t)[k] = spi_xfer(CMD_NOP);
-                    gp_hi(GPIOA, PIN_CSN);
-                    if (tlm_valid(&t)) { g_tlm = t; g_tlm_n++; }
-                } else {
-                    rf_cmd(CMD_FLUSH_RX);      /* wrong width: not ours */
-                }
-                rf_wr(REG_STATUS, ST_RX_DR);
-            }
-            return 1;
-        }
+        if (st & ST_TX_DS)  { rf_wr(REG_STATUS, ST_TX_DS); return 1; }
         if (st & ST_MAX_RT) { rf_wr(REG_STATUS, ST_MAX_RT); rf_cmd(CMD_FLUSH_TX); return 0; }
         delay_us(10);
     }
@@ -337,8 +305,67 @@ static void clock_init_hse72(void)
 #define SCB_VTOR (*(volatile uint32_t *)0xE000ED08u)
 #define APP_BASE 0x08000800u   /* HID bootloader reserves the first 2 KB */
 
+/* Twenty seconds at 8 MHz before the normal 72 MHz startup.
+ *
+ * The link was seen working from this board when it ran at 8 MHz with no USB.
+ * Raising the clock and adding USB is the only change on the transmit path
+ * since. This reproduces the old conditions briefly and then restores the
+ * normal ones, so the board is never stranded without its USB console. The
+ * result is read on the drone's UART, not here. */
+static void hsi8_burst(void)
+{
+    static const uint8_t addr[RF_ADDR_LEN] = RF_ADDR;
+
+    RCC_CR |= (1u << 0);
+    while (!(RCC_CR & (1u << 1))) { }
+    RCC_CFGR &= ~3u;                       /* SW = HSI, 8 MHz */
+    while ((RCC_CFGR & (3u << 2)) != 0) { }
+    RCC_CR &= ~(1u << 24);                 /* PLL off, safe now that HSI drives the core */
+
+    RCC_APB2ENR |= IOPAEN | IOPBEN | AFIOEN | SPI1EN;
+    cfg_pin(GPIOA, PIN_CSN, CNF_OUT_PP);
+    cfg_pin(GPIOA, 5, CNF_AF_PP);
+    cfg_pin(GPIOA, 6, CNF_IN_FLOAT);
+    cfg_pin(GPIOA, 7, CNF_AF_PP);
+    cfg_pin(GPIOB, PIN_CE, CNF_OUT_PP);
+    gp_hi(GPIOA, PIN_CSN);
+    gp_lo(GPIOB, PIN_CE);
+    SPI1_CR1 = (1u << 2) | (2u << 3) | (1u << 9) | (1u << 8) | (1u << 6);  /* /8 -> 1 MHz */
+
+    rf_wr(REG_CONFIG, CFG_EN_CRC | CFG_CRCO | CFG_PWR_UP);
+    for (volatile uint32_t i = 0; i < 40000u; i++) { }
+    rf_wr(REG_EN_AA,      0x00);
+    rf_wr(REG_EN_RXADDR,  0x01);
+    rf_wr(REG_SETUP_AW,   0x03);
+    rf_wr(REG_SETUP_RETR, 0x00);
+    rf_wr(REG_RF_CH,      RF_CHANNEL);
+    rf_wr(REG_RF_SETUP,   0x06);
+    rf_wr_buf(REG_TX_ADDR,    addr, RF_ADDR_LEN);
+    rf_wr_buf(REG_RX_ADDR_P0, addr, RF_ADDR_LEN);
+    rf_cmd(CMD_FLUSH_TX);
+    rf_wr(REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
+
+    pkt_t p = { PKT_MAGIC, 0, 0, 128, 128, 128, 0, 0 };
+    for (uint32_t n = 0; n < 1000u; n++) {          /* roughly 20 s */
+        p.seq++;
+        p.sum = pkt_sum(&p);
+        gp_lo(GPIOA, PIN_CSN);
+        spi_xfer(CMD_W_TX_PAYLOAD);
+        for (uint32_t i = 0; i < RF_PAYLOAD; i++) spi_xfer(((const uint8_t *)&p)[i]);
+        gp_hi(GPIOA, PIN_CSN);
+
+        gp_hi(GPIOB, PIN_CE);
+        for (volatile uint32_t i = 0; i < 40u; i++) { }
+        gp_lo(GPIOB, PIN_CE);
+
+        for (volatile uint32_t i = 0; i < 12000u; i++) { }
+        rf_wr(REG_STATUS, ST_TX_DS | ST_MAX_RT);
+    }
+}
+
 int main(void)
 {
+    hsi8_burst();
 
     /* The bootloader left its own vector table active. Point the core at ours;
      * this build polls rather than using interrupts, but leaving VTOR stale is
@@ -484,8 +511,6 @@ int main(void)
             puts_(" rf=0x");   puthex(rf_rd(REG_RF_SETUP));
             puts_(" retr=0x"); puthex(rf_rd(REG_SETUP_RETR));
             puts_(" aa=0x");   puthex(rf_rd(REG_EN_AA));
-            puts_(" feat=0x"); puthex(rf_rd(REG_FEATURE));
-            puts_(" dpd=0x");  puthex(rf_rd(REG_DYNPD));
             puts_("\r\n");
             puts_("rx good="); putdec(sent);
             puts_(" failed=");  putdec(failed);
@@ -494,15 +519,6 @@ int main(void)
             puts_(" STATUS=0x");puthex(st);
             puts_(" FIFO=0x");  puthex(fs);
             puts_(a0 == 0x00 || a0 == 0xFF ? "  <- khong thay radio\r\n" : "\r\n");
-            puts_("tlm n="); putdec(g_tlm_n);
-            puts_(" mpu="); puts_((g_tlm.flags & TLM_MPU_OK) ? "ok" : "mat");
-            puts_(" ax="); putdec((uint32_t)(g_tlm.ax < 0 ? -g_tlm.ax : g_tlm.ax));
-            puts_(g_tlm.ax < 0 ? "-" : "+");
-            puts_(" ay="); putdec((uint32_t)(g_tlm.ay < 0 ? -g_tlm.ay : g_tlm.ay));
-            puts_(g_tlm.ay < 0 ? "-" : "+");
-            puts_(" az="); putdec((uint32_t)(g_tlm.az < 0 ? -g_tlm.az : g_tlm.az));
-            puts_(g_tlm.az < 0 ? "-" : "+");
-            puts_("\r\n");
         }
     }
 }
