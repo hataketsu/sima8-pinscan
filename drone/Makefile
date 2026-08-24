@@ -21,3 +21,9 @@ flash: drone.bin
 
 clean:
 	rm -f drone.elf drone.bin drone.map
+
+# Flash over the ROM UART bootloader instead of SWD.
+# Set BOOT0 = 1 and reset first; set it back to 0 and reset when done.
+PORT ?= /dev/cu.usbserial-11230
+uart-flash: drone.bin
+	../host/uart_flash.sh drone.bin $(PORT)

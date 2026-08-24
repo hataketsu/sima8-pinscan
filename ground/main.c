@@ -205,8 +205,16 @@ static uint32_t rf_send(const pkt_t *p)
     return 0;
 }
 
+#define SCB_VTOR (*(volatile uint32_t *)0xE000ED08u)
+#define APP_BASE 0x08002000u
+
 int main(void)
 {
+    /* The bootloader left its own vector table active. Point the core at ours;
+     * this build polls rather than using interrupts, but leaving VTOR stale is
+     * a trap for the first interrupt anyone adds later. */
+    SCB_VTOR = APP_BASE;
+
     RCC_APB2ENR |= IOPAEN | IOPBEN | AFIOEN;
     STK_LOAD = 0x00FFFFFFu; STK_VAL = 0; STK_CTRL = 5;
     stk_last = STK_VAL;
@@ -238,9 +246,21 @@ int main(void)
 
         if (now - last_report >= 1000) {
             last_report = now;
+            /* Register readbacks separate "no radio on the bus" from "radio
+             * present but the transmit is failing": a missing or unpowered
+             * module reads 0x00 or 0xFF everywhere, while a live one echoes
+             * the address and channel that were written into it. */
+            uint8_t a0 = rf_rd(REG_RX_ADDR_P0);
+            uint8_t cf = rf_rd(REG_CONFIG);
+            uint8_t st = rf_rd(REG_STATUS);
+            uint8_t fs = rf_rd(REG_FIFO_STATUS);
             puts_("tx sent="); putdec(sent);
-            puts_(" failed="); putdec(failed);
-            puts_("\r\n");
+            puts_(" failed=");  putdec(failed);
+            puts_(" ADDR0=0x"); puthex(a0);
+            puts_(" CONFIG=0x");puthex(cf);
+            puts_(" STATUS=0x");puthex(st);
+            puts_(" FIFO=0x");  puthex(fs);
+            puts_(a0 == 0x00 || a0 == 0xFF ? "  <- khong thay radio\r\n" : "\r\n");
         }
     }
 }
