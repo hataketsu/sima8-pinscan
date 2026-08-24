@@ -37,6 +37,38 @@ static inline uint8_t pkt_sum(const pkt_t *p)
     return s;
 }
 
+/* Telemetry rides back inside the auto-ack.
+ *
+ * The drone's CE is strapped high, so it can never be put into standby, and
+ * changing PRIM_RX while it is live latches the radio. Ack payloads avoid that
+ * entirely: the receiver stays in RX forever, the transmitter stays in TX
+ * forever, and the turnaround is done by the radio hardware.
+ *
+ * Raw sensor counts are sent rather than angles: the firmware links without
+ * libm, and the host can do the trigonometry with far more precision anyway. */
+#define TLM_MAGIC   0x5A
+#define TLM_LEN     16
+#define TLM_MPU_OK  0x01
+
+typedef struct {
+    uint8_t magic, seq;
+    int16_t ax, ay, az, gx, gy, gz;
+    uint8_t flags, sum;
+} tlm_t;
+
+static inline uint8_t tlm_sum(const tlm_t *t)
+{
+    const uint8_t *b = (const uint8_t *)t;
+    uint8_t s = 0;
+    for (uint32_t i = 0; i < TLM_LEN - 1; i++) s ^= b[i];
+    return s;
+}
+
+static inline int tlm_valid(const tlm_t *t)
+{
+    return t->magic == TLM_MAGIC && t->sum == tlm_sum(t);
+}
+
 static inline int pkt_valid(const pkt_t *p)
 {
     return p->magic == PKT_MAGIC && p->sum == pkt_sum(p);
@@ -47,6 +79,9 @@ static inline int pkt_valid(const pkt_t *p)
 #define CMD_W_REG        0x20
 #define CMD_R_RX_PAYLOAD 0x61
 #define CMD_W_TX_PAYLOAD 0xA0
+#define CMD_W_ACK_PAYLOAD 0xA8
+#define CMD_R_RX_PL_WID   0x60
+#define CMD_ACTIVATE      0x50
 #define CMD_FLUSH_TX     0xE1
 #define CMD_FLUSH_RX     0xE2
 #define CMD_NOP          0xFF
@@ -63,6 +98,11 @@ static inline int pkt_valid(const pkt_t *p)
 #define REG_TX_ADDR     0x10
 #define REG_RX_PW_P0    0x11
 #define REG_FIFO_STATUS 0x17
+#define REG_DYNPD       0x1C
+#define REG_FEATURE     0x1D
+
+#define FEAT_EN_DPL     0x04
+#define FEAT_EN_ACK_PAY 0x02
 
 #define CFG_PRIM_RX  0x01
 #define CFG_PWR_UP   0x02

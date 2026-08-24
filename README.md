@@ -127,6 +127,33 @@ The third sweep ran against a live link with packets arriving, pulled each pin
 low, and looked for the flow to stop. Nothing stopped it, and the link was still
 up afterwards. Same conclusion as the second sweep, but this time supported.
 
+## Any radio config change needs a power cycle
+
+Because CE is strapped, the radio can never be parked in standby, so every
+register change lands on a live part. In practice anything touched beyond the
+initial setup — PRIM_RX, EN_AA, FEATURE, DYNPD — leaves it answering SPI
+perfectly while nothing crosses the air. Removing power is the only recovery.
+
+Treat the radio setup as write-once at power-up. If it must change, expect to
+pull the drone's power afterwards.
+
+## Auto-ack does not work between these two parts
+
+Telemetry was meant to ride back inside the acknowledgement, which would have
+avoided ever changing direction. It does not work with this pair:
+
+- With `EN_AA` enabled on both ends the drone receives **nothing at all** — not
+  unacknowledged packets, no packets. Turning it off restores the link.
+- The ground's module will not hold the `EN_ACK_PAY` bit: write `0x06` to
+  FEATURE and it reads back `0x04`. A partial write like that usually means the
+  part is one of the clones that never implemented ack payloads.
+
+So control is one-way, and attitude comes back over the drone's UART instead.
+Two ways out, neither tried yet: a different nRF24 module, or a wire from the
+BK2425's CE pin to a spare GPIO. The second is the better fix — with CE under
+control the radio can be parked properly and this whole class of problem, the
+latching included, goes away.
+
 ## Sensor check
 
 Phase 6 streams live MPU6050 samples so a host can tell a working sensor from

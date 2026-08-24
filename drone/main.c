@@ -180,12 +180,19 @@ static void puthex(uint8_t v)
     static const char H[] = "0123456789ABCDEF";
     putc_(H[v >> 4]); putc_(H[v & 15]);
 }
+static void putsig(int16_t v);
 static void putdec(uint32_t v)
 {
     char b[12]; int i = 0;
     if (!v) { putc_('0'); return; }
     while (v) { uint32_t q = 0; while (v >= 10) { v -= 10; q++; } b[i++] = (char)('0' + v); v = q; }
     while (i--) putc_(b[i]);
+}
+
+static void putsig(int16_t v)
+{
+    if (v < 0) { putc_('-'); putdec((uint32_t)(-(int32_t)v)); }
+    else putdec((uint32_t)v);
 }
 
 /* ---- SPI1 ---- */
@@ -211,6 +218,97 @@ static uint8_t spi_xfer(uint8_t v)
     SPI1_DR8 = v;
     while (!(SPI1_SR & (1u << 0))) { }      /* RXNE */
     return SPI1_DR8;
+}
+
+/* ---- MPU6050 on PB6/PB7, bit-banged ----
+ * I2C1 sits on exactly these pins, but bit-banging keeps this independent of
+ * the alternate-function mapping, which is the one part of the pin map that was
+ * read off a datasheet rather than measured. */
+#define GPIOB ((gpio_t *)0x48000400u)
+#define SCL 6
+#define SDA 7
+#define MPU_ADDR 0xD0
+#define I2C_HALF 40
+
+static void pb_in(uint32_t p)  { GPIOB->MODER &= ~(3u << (p * 2));
+                                 GPIOB->PUPDR = (GPIOB->PUPDR & ~(3u << (p * 2))) | (1u << (p * 2)); }
+static void pb_low(uint32_t p) { GPIOB->BRR = 1u << p;
+                                 GPIOB->OTYPER &= ~(1u << p);
+                                 GPIOB->MODER = (GPIOB->MODER & ~(3u << (p * 2))) | (1u << (p * 2)); }
+static uint32_t pb_rd(uint32_t p) { return (GPIOB->IDR >> p) & 1u; }
+static void ib_dly(volatile uint32_t n) { while (n--) __asm__ volatile("nop"); }
+
+static void i2c_start(void)
+{
+    pb_in(SDA); pb_in(SCL); ib_dly(I2C_HALF);
+    pb_low(SDA); ib_dly(I2C_HALF);
+    pb_low(SCL); ib_dly(I2C_HALF);
+}
+static void i2c_stop(void)
+{
+    pb_low(SDA); ib_dly(I2C_HALF);
+    pb_in(SCL);  ib_dly(I2C_HALF);
+    pb_in(SDA);  ib_dly(I2C_HALF);
+}
+static uint32_t i2c_wr(uint8_t b)
+{
+    for (int i = 7; i >= 0; i--) {
+        if ((b >> i) & 1) pb_in(SDA); else pb_low(SDA);
+        ib_dly(I2C_HALF);
+        pb_in(SCL); ib_dly(I2C_HALF);
+        pb_low(SCL); ib_dly(I2C_HALF);
+    }
+    pb_in(SDA); ib_dly(I2C_HALF);
+    pb_in(SCL);  ib_dly(I2C_HALF);
+    uint32_t ack = !pb_rd(SDA);
+    pb_low(SCL); ib_dly(I2C_HALF);
+    return ack;
+}
+static uint8_t i2c_rd(uint32_t ack)
+{
+    uint8_t v = 0;
+    pb_in(SDA);
+    for (int i = 7; i >= 0; i--) {
+        ib_dly(I2C_HALF);
+        pb_in(SCL); ib_dly(I2C_HALF);
+        v |= (uint8_t)(pb_rd(SDA) << i);
+        pb_low(SCL); ib_dly(I2C_HALF);
+    }
+    if (ack) pb_low(SDA); else pb_in(SDA);
+    ib_dly(I2C_HALF);
+    pb_in(SCL); ib_dly(I2C_HALF);
+    pb_low(SCL); ib_dly(I2C_HALF);
+    pb_in(SDA);
+    return v;
+}
+static uint32_t mpu_wr(uint8_t reg, uint8_t val)
+{
+    i2c_start();
+    if (!i2c_wr(MPU_ADDR) || !i2c_wr(reg) || !i2c_wr(val)) { i2c_stop(); return 0; }
+    i2c_stop();
+    return 1;
+}
+static uint32_t mpu_burst(uint8_t reg, uint8_t *b, uint32_t n)
+{
+    i2c_start();
+    if (!i2c_wr(MPU_ADDR) || !i2c_wr(reg)) { i2c_stop(); return 0; }
+    i2c_start();
+    if (!i2c_wr(MPU_ADDR | 1)) { i2c_stop(); return 0; }
+    for (uint32_t i = 0; i < n; i++) b[i] = i2c_rd(i + 1 < n);
+    i2c_stop();
+    return 1;
+}
+static uint32_t mpu_begin(void)
+{
+    RCC_AHBENR |= IOPBEN;
+    pb_in(SCL); pb_in(SDA);
+    delay_ms(2);
+    if (!mpu_wr(0x6B, 0x01)) return 0;   /* leave sleep, clock off the X gyro */
+    delay_ms(20);
+    mpu_wr(0x1B, 0x00);                  /* gyro  +-250 dps */
+    mpu_wr(0x1C, 0x00);                  /* accel +-2 g     */
+    mpu_wr(0x19, 0x07);                  /* sample rate divider */
+    return 1;
 }
 
 /* ---- radio ---- */
@@ -273,6 +371,18 @@ static void rf_init_rx(void)
     rf_wr_buf(REG_RX_ADDR_P0, addr, RF_ADDR_LEN);
     rf_wr_buf(REG_TX_ADDR,    addr, RF_ADDR_LEN);
     rf_wr(REG_RX_PW_P0,   RF_PAYLOAD);
+
+    /* Auto-ack is off. Turning it on stops this pair talking altogether: the
+     * drone receives nothing at all, not merely unacknowledged packets. The
+     * ground's module also refuses to keep the EN_ACK_PAY bit — FEATURE reads
+     * back 0x04 after writing 0x06 — so ack payloads are not available here. */
+    rf_wr(REG_EN_AA, 0x00);
+    if (rf_rd(REG_FEATURE) == 0) {
+        pa_lo(PIN_CSN); spi_xfer(CMD_ACTIVATE); spi_xfer(0x73); pa_hi(PIN_CSN);
+    }
+    rf_wr(REG_FEATURE, 0x00);
+    rf_wr(REG_DYNPD,   0x00);
+
     rf_cmd(CMD_FLUSH_RX);
     rf_wr(REG_STATUS, ST_RX_DR | ST_TX_DS | ST_MAX_RT);
 }
@@ -305,6 +415,9 @@ int main(void)
 
     pkt_t pkt;
     uint32_t good = 0, bad = 0;
+    tlm_t tlm = { TLM_MAGIC, 0, 0,0,0, 0,0,0, 0, 0 };
+    uint32_t last_tlm = 0;
+    uint32_t mpu_ok = mpu_begin();
     /* Received Power Detector: set while incoming power is above about
      * -64 dBm. Sampling it separates "no RF is arriving at all" from "RF
      * arrives but the packets are being rejected". */
@@ -353,6 +466,31 @@ int main(void)
             if (led) pa_hi(PIN_LED); else pa_lo(PIN_LED);
         }
 
+        /* Refresh the queued ack payload. Only one can be pending, so it is
+         * flushed first: a stale reading is worse than a missed one. */
+        if (now - last_tlm >= 20u) {
+            last_tlm = now;
+            uint8_t b[14];
+            tlm.magic = TLM_MAGIC;
+            tlm.seq++;
+            if (mpu_ok && mpu_burst(0x3B, b, 14)) {
+                tlm.ax = (int16_t)(((uint16_t)b[0]  << 8) | b[1]);
+                tlm.ay = (int16_t)(((uint16_t)b[2]  << 8) | b[3]);
+                tlm.az = (int16_t)(((uint16_t)b[4]  << 8) | b[5]);
+                tlm.gx = (int16_t)(((uint16_t)b[8]  << 8) | b[9]);
+                tlm.gy = (int16_t)(((uint16_t)b[10] << 8) | b[11]);
+                tlm.gz = (int16_t)(((uint16_t)b[12] << 8) | b[13]);
+                tlm.flags = TLM_MPU_OK;
+            } else {
+                tlm.flags = 0;
+            }
+            tlm.sum = tlm_sum(&tlm);
+
+            /* No ack payload is queued: this pair will not run auto-ack, and
+             * issuing W_ACK_PAYLOAD with the feature disabled only disturbs the
+             * receiver. Telemetry goes out over the UART instead. */
+        }
+
         if (now - last_report >= 1000) {
             last_report = now;
             /* Both ends claim to be configured, so print what the radio
@@ -366,12 +504,27 @@ int main(void)
             puts_(" aw=0x");  puthex(rf_rd(REG_SETUP_AW));
             puts_(" pw=");    putdec(rf_rd(REG_RX_PW_P0));
             puts_(" rf=0x");  puthex(rf_rd(REG_RF_SETUP));
+            puts_(" aa=0x");  puthex(rf_rd(REG_EN_AA));
+            puts_(" feat=0x");puthex(rf_rd(REG_FEATURE));
+            puts_(" dpd=0x"); puthex(rf_rd(REG_DYNPD));
             puts_("\r\n");
             puts_("rx good="); putdec(good);
             puts_(" bad=");    putdec(bad);
             puts_(" thr=");    putdec(pkt.throttle);
             puts_(" link=");   puts_(link_up ? "UP" : "DOWN");
             puts_(" motor=");  puts_(motors_live ? "ON" : "off");
+            puts_("\r\n");
+            /* One line the host can parse: signed raw counts, no trig here.
+             * The firmware links without libm and the host has far more
+             * precision to spend on the arctangent anyway. */
+            puts_("IMU ");
+            puts_(mpu_ok ? "ok " : "mat ");
+            putsig(tlm.ax); putc_(' ');
+            putsig(tlm.ay); putc_(' ');
+            putsig(tlm.az); putc_(' ');
+            putsig(tlm.gx); putc_(' ');
+            putsig(tlm.gy); putc_(' ');
+            putsig(tlm.gz);
             puts_("\r\n");
         }
     }

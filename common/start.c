@@ -22,3 +22,20 @@ void (*const g_vectors[])(void) = {
     Default_Handler,    /* NMI       */
     Default_Handler,    /* HardFault */
 };
+
+/* GCC emits calls to these for aggregate initialisers and struct copies even at
+ * -nostdlib, so the freestanding builds have to supply them. */
+void *memset(void *d, int c, unsigned long n)
+{
+    unsigned char *p = d;
+    while (n--) *p++ = (unsigned char)c;
+    return d;
+}
+
+void *memcpy(void *d, const void *s, unsigned long n)
+{
+    unsigned char *a = d;
+    const unsigned char *b = s;
+    while (n--) *a++ = *b++;
+    return d;
+}

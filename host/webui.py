@@ -6,29 +6,34 @@
 Opens the ground unit's USB CDC port, serves a page on localhost, and relays
 commands to it. It has to run locally: a hosted page cannot open a serial port.
 """
-import json, os, select, sys, termios, threading, time
+import json, math, os, select, sys, termios, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/cu.usbmodem00011"
 HTTP = int(sys.argv[2]) if len(sys.argv) > 2 else 8088
+# Optional second port: the drone's own UART, which carries the IMU line.
+# Attitude comes over that link because the radio is one-way.
+DRONE = sys.argv[3] if len(sys.argv) > 3 else "/dev/cu.usbserial-11230"
 
 state = {
     "connected": False, "sent": 0, "failed": 0, "addr0": "", "config": "",
     "status": "", "fifo": "", "throttle": 0, "armed": False,
     "roll": 128, "pitch": 128, "yaw": 128, "lines": [], "updated": 0,
+    "imu": False, "ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0,
+    "roll_deg": 0.0, "pitch_deg": 0.0, "drone_lines": [],
 }
 lock = threading.Lock()
 fd = None
 
 
-def serial_open(path):
+def serial_open(path, speed=None):
     # 115200 is arbitrary for CDC, but never 1200: that is the reboot-to-
     # bootloader convention and would drop the device mid-session.
     f = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     a = termios.tcgetattr(f)
     a[0] = a[1] = a[3] = 0
     a[2] = termios.CLOCAL | termios.CREAD | termios.CS8
-    a[4] = a[5] = termios.B115200
+    a[4] = a[5] = speed if speed is not None else termios.B115200
     a[6][termios.VMIN] = 0
     a[6][termios.VTIME] = 0
     termios.tcsetattr(f, termios.TCSANOW, a)
@@ -57,6 +62,58 @@ def parse(line):
         elif line.startswith("DISARMED"):
             state["armed"] = False
             state["throttle"] = 0
+
+
+def parse_drone(line):
+    """The drone prints: IMU ok ax ay az gx gy gz, in raw counts."""
+    with lock:
+        state["drone_lines"] = (state["drone_lines"] + [line])[-40:]
+    if not line.startswith("IMU "):
+        return
+    f = line.split()
+    if len(f) != 8:
+        return
+    try:
+        vals = [int(x) for x in f[2:]]
+    except ValueError:
+        return
+    ax, ay, az, gx, gy, gz = vals
+    with lock:
+        state["imu"] = (f[1] == "ok")
+        state["ax"], state["ay"], state["az"] = ax, ay, az
+        state["gx"], state["gy"], state["gz"] = gx, gy, gz
+        # Accelerometer-only attitude: no gyro fusion, so it is honest at rest
+        # and wrong under acceleration. Good enough to read a tilt off a bench.
+        state["roll_deg"] = math.degrees(math.atan2(ay, az))
+        state["pitch_deg"] = math.degrees(math.atan2(-ax, math.hypot(ay, az)))
+
+
+def drone_reader():
+    fd2, buf = None, b""
+    while True:
+        if fd2 is None:
+            try:
+                fd2 = serial_open(DRONE, termios.B9600)
+            except OSError:
+                time.sleep(1.0)
+                continue
+        try:
+            r, _, _ = select.select([fd2], [], [], 0.3)
+            if not r:
+                continue
+            chunk = os.read(fd2, 4096)
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                t = line.decode("ascii", "replace").strip()
+                if t:
+                    parse_drone(t)
+        except OSError:
+            try:
+                os.close(fd2)
+            except OSError:
+                pass
+            fd2 = None
 
 
 def reader():
@@ -162,6 +219,21 @@ max-height:260px;overflow:auto;margin:0;color:var(--dim);font-size:12px}
 DISARM also forces throttle to 0.</div>
 </div>
 
+<div class=grid style="margin-top:12px">
+<div class=card><div class=k>imu</div><div class="v" id=imu>...</div></div>
+<div class=card><div class=k>roll</div><div class=v id=roll>-</div></div>
+<div class=card><div class=k>pitch</div><div class=v id=pitch>-</div></div>
+<div class=card><div class=k>az (1g = 16384)</div><div class=v id=az>-</div></div>
+</div>
+
+<div class=card><div class=k>tilt</div>
+<svg id=att viewBox="0 0 300 120" style="width:100%;height:120px">
+<line x1=150 y1=10 x2=150 y2=110 stroke="#262b36" stroke-width=1></line>
+<line x1=20 y1=60 x2=280 y2=60 stroke="#262b36" stroke-width=1></line>
+<line id=hz x1=40 y1=60 x2=260 y2=60 stroke="#5b9dff" stroke-width=3></line>
+<circle id=dot cx=150 cy=60 r=5 fill="#3ecf8e"></circle>
+</svg></div>
+
 <div class=card style="margin-top:12px"><div class=k>radio registers</div>
 <div class=row><span id=regs class=v style="font-size:14px">-</span></div></div>
 
@@ -191,7 +263,17 @@ async function tick(){
     $('failed').className='v '+(s.failed?'bad':'ok');
     $('regs').textContent='ADDR0='+s.addr0+'  CONFIG='+s.config+
       '  STATUS='+s.status+'  FIFO='+s.fifo;
-    $('log').textContent=s.lines.join('\\n');
+    $('imu').textContent=s.imu?'live':'no data';
+    $('imu').className='v '+(s.imu?'ok':'bad');
+    $('roll').textContent=s.roll_deg.toFixed(1)+'\u00b0';
+    $('pitch').textContent=s.pitch_deg.toFixed(1)+'\u00b0';
+    $('az').textContent=s.az;
+    const r=s.roll_deg*Math.PI/180, dx=110*Math.cos(r), dy=110*Math.sin(r);
+    const cy=60 - Math.max(-45,Math.min(45,s.pitch_deg));
+    $('hz').setAttribute('x1',150-dx); $('hz').setAttribute('y1',cy-dy);
+    $('hz').setAttribute('x2',150+dx); $('hz').setAttribute('y2',cy+dy);
+    $('dot').setAttribute('cy',cy);
+    $('log').textContent=s.lines.concat(s.drone_lines.slice(-10)).join('\\n');
     $('log').scrollTop=$('log').scrollHeight;
   }catch(e){ $('conn').textContent='server gone'; $('conn').className='v bad'; }
 }
@@ -231,6 +313,8 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=reader, daemon=True).start()
-    print(f"serial : {PORT}")
+    threading.Thread(target=drone_reader, daemon=True).start()
+    print(f"ground : {PORT}")
+    print(f"drone  : {DRONE}")
     print(f"open   : http://127.0.0.1:{HTTP}/")
     ThreadingHTTPServer(("127.0.0.1", HTTP), H).serve_forever()
