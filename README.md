@@ -88,28 +88,31 @@ Both facts simplify the driver: no CE strobe to sequence, no interrupt line to
 service. Mode switching happens through the PRIM_RX bit in CONFIG, which works
 because CE is permanently asserted.
 
-## The radio latches, and only a power cycle clears it
+## What looked like latching was two separate diseases
 
-This cost more time than anything else, so it is worth stating plainly.
+The radio spent weeks appearing to "latch": SPI answering, registers reading
+back correctly, chip id still `0x63`, nothing crossing the air, and only a
+power cycle ever bringing it back. That turned out to be two unrelated
+mechanisms, both now understood and both fixable in software:
 
-`CE` on the drone's BK2425 is tied high on the board. No MCU pin controls it,
-which means the radio can never be put into standby. The datasheet wants `CE`
-low before `PRIM_RX` is changed, and with the pin strapped there is no way to
-comply: switching between transmit and receive happens while the radio is live.
-Do that and the part stops working — SPI still answers, every register reads
-back exactly what was written, the chip id still reads `0x63`, and nothing goes
-out or comes in. An MCU reset does not help, because the BK2425 has no reset
-line and keeps its state across them. Only removing power recovers it.
+**1. Radio init races the radio's own power-up.** Straight after battery
+plug-in the MCU boots faster than the radio. Configuration written in that
+window is silently ignored — every register reads its power-on default
+afterwards (`RF_CH=2`, `RX_ADDR_P0=0xE7...`, `CONFIG=0x08`, power still down).
+That is the whole reason the link only came up on some power cycles: it was a
+race, and sometimes the firmware lost. The fix is to write the configuration,
+read it back, and retry until it sticks (`drone/main.c`), plus a once-a-second
+self-heal that reinits if `RF_CH` ever stops reading 76.
 
-That is why the link kept appearing to die: each mode change stuck the radio,
-and each round of debugging reset only the MCU.
-
-Practical consequences:
-
-- Set `PRIM_RX` once, at power-up, and leave it alone. This firmware is receive
-  only for that reason.
-- When the radio stops responding on air but still answers over SPI, power-cycle
-  the board before changing anything in software.
+**2. `PRIM_RX` writes do not move the state machine.** `CE` is tied high, so
+the chip never passes through standby, and this part only samples `PRIM_RX`
+on its way out of *power-down*. Writing `PRIM_RX` on the live chip updates
+the register — it reads back changed — while the radio keeps doing what it
+was doing. `CONFIG` reading `0x0E` (TX) while `RX_DR` keeps firing is this
+bug in one line. The mode is really changed by bouncing `PWR_UP`: power the
+radio down, then wake it with the new `PRIM_RX` value. Both modules here
+need this — the ground unit's clone has the same behaviour even though its
+`CE` is a real, properly-driven pin.
 
 ### The CE conclusion was wrong the first two times
 
@@ -127,15 +130,33 @@ The third sweep ran against a live link with packets arriving, pulled each pin
 low, and looked for the flow to stop. Nothing stopped it, and the link was still
 up afterwards. Same conclusion as the second sweep, but this time supported.
 
-## Any radio config change needs a power cycle
+## Two-way link over one strapped-CE radio
 
-Because CE is strapped, the radio can never be parked in standby, so every
-register change lands on a live part. In practice anything touched beyond the
-initial setup — PRIM_RX, EN_AA, FEATURE, DYNPD — leaves it answering SPI
-perfectly while nothing crosses the air. Removing power is the only recovery.
+With the two mechanisms above understood, the link runs both directions on a
+20 ms cycle with no hardware change:
 
-Treat the radio setup as write-once at power-up. If it must change, expect to
-pull the drone's power afterwards.
+- Ground transmits a control packet, then bounces `PWR_UP` into RX and
+  listens for the rest of the slot.
+- The drone answers every 5th control packet with a 16-byte telemetry burst:
+  wait 4 ms (for the ground's own bounce to finish), bounce `PWR_UP` into TX,
+  wait 3 ms for the PLL, **then** write the payload, poll `TX_DS`, bounce back
+  into RX.
+
+Two details that cost real debugging time:
+
+- The payload must be written *after* the wake into TX. Queued before the
+  power-down bounce, `TX_DS` still asserts but nothing valid leaves the
+  antenna — the TX FIFO does not survive power-down on this part. The
+  ground's RPD (carrier detect, register 0x09) showed energy arriving while
+  no packet was accepted, which is what pointed at a corrupted transmit.
+- The UART print path must never block the main loop, or the 3-deep RX FIFO
+  overflows and packets silently vanish (`FIFO_STATUS` reads `RX_FULL`).
+  Drain the RX FIFO until `RX_EMPTY` every pass and send UART through a ring
+  buffer.
+
+Measured: control 33 pkt/s with 0 bad, telemetry ~5 of 6.6 bursts/s received.
+Known-good binaries live under `release/` (`link-ok-v1` one-way,
+`rf-2way-v2` two-way).
 
 ## Auto-ack does not work between these two parts
 
@@ -148,11 +169,9 @@ avoided ever changing direction. It does not work with this pair:
   FEATURE and it reads back `0x04`. A partial write like that usually means the
   part is one of the clones that never implemented ack payloads.
 
-So control is one-way, and attitude comes back over the drone's UART instead.
-Two ways out, neither tried yet: a different nRF24 module, or a wire from the
-BK2425's CE pin to a spare GPIO. The second is the better fix — with CE under
-control the radio can be parked properly and this whole class of problem, the
-latching included, goes away.
+So ack payloads stay off. Telemetry rides back as explicit bursts on a
+half-duplex schedule instead — see “Two-way link over one strapped-CE
+radio” above.
 
 ## Sensor check
 
