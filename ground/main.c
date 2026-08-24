@@ -206,7 +206,7 @@ static uint32_t rf_send(const pkt_t *p)
 }
 
 #define SCB_VTOR (*(volatile uint32_t *)0xE000ED08u)
-#define APP_BASE 0x08002000u
+#define APP_BASE 0x08000800u   /* HID bootloader reserves the first 2 KB */
 
 int main(void)
 {
