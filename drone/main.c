@@ -32,6 +32,17 @@
 #define SPI1_SR   (*(volatile uint32_t *)0x40013008u)
 #define SPI1_DR8  (*(volatile uint8_t  *)0x4001300Cu)
 
+#define RCC_APB1ENR (*(volatile uint32_t *)0x4002101Cu)
+#define TIM1EN      (1u << 11)   /* APB2 */
+#define TIM2EN      (1u << 0)    /* APB1 */
+
+typedef struct {
+    volatile uint32_t CR1, CR2, SMCR, DIER, SR, EGR, CCMR1, CCMR2, CCER,
+                      CNT, PSC, ARR, RCR, CCR1, CCR2, CCR3, CCR4, BDTR;
+} tim_t;
+#define TIM1 ((tim_t *)0x40012C00u)
+#define TIM2 ((tim_t *)0x40000000u)
+
 #define USART1_CR1 (*(volatile uint32_t *)0x40013800u)
 #define USART1_BRR (*(volatile uint32_t *)0x4001380Cu)
 #define USART1_ISR (*(volatile uint32_t *)0x4001381Cu)
@@ -45,6 +56,9 @@ typedef struct {
 #define PIN_CSN   4
 #define PIN_LED   1
 static const uint8_t MOTOR[4] = { 2, 3, 8, 11 };   /* M1 M2 M3 M4 */
+
+/* Non-zero only while the pins belong to the timers. */
+static uint32_t motors_live;
 
 /* ---- pin helpers, port A only ---- */
 static void pa_out(uint32_t p)
@@ -66,6 +80,64 @@ static void motors_off(void)
 {
     RCC_AHBENR |= IOPAEN;
     for (uint32_t i = 0; i < 4; i++) { pa_hi(MOTOR[i]); pa_out(MOTOR[i]); }
+    motors_live = 0;
+}
+
+/* ---- motor PWM ----
+ *
+ * M1 PA2 = TIM2_CH3   M2 PA3 = TIM2_CH4   M3 PA8 = TIM1_CH1   M4 PA11 = TIM1_CH4
+ *
+ * The gates are active low, so the channels run PWM mode 1 with CCxP set, which
+ * inverts the output: CCR = 0 leaves the pin high and the motor off, CCR = ARR
+ * holds it low for full drive. Getting this backwards would spin every motor at
+ * full throttle the moment the timer starts.
+ *
+ * The pins are only handed to the timer while armed. Disarming, a failsafe, or
+ * a reset takes them back as plain GPIO driven high, so every path out of
+ * flight ends with the gates off regardless of what the timer registers hold.
+ */
+#define PWM_ARR 499u             /* 8 MHz / 500 = 16 kHz, above audible whine */
+
+static void pwm_init(void)
+{
+    RCC_APB2ENR |= TIM1EN;
+    RCC_APB1ENR |= TIM2EN;
+
+    TIM2->PSC = 0; TIM2->ARR = PWM_ARR;
+    TIM2->CCR3 = 0; TIM2->CCR4 = 0;
+    TIM2->CCMR2 = (6u << 4) | (1u << 3)        /* CH3: PWM mode 1, preload */
+                | (6u << 12) | (1u << 11);     /* CH4: PWM mode 1, preload */
+    TIM2->CCER  = (1u << 8) | (1u << 9)        /* CH3 enable, active low */
+                | (1u << 12) | (1u << 13);     /* CH4 enable, active low */
+    TIM2->CR1  |= (1u << 7) | (1u << 0);       /* ARPE, CEN */
+    TIM2->EGR   = 1;                           /* load the preloads */
+
+    TIM1->PSC = 0; TIM1->ARR = PWM_ARR;
+    TIM1->CCR1 = 0; TIM1->CCR4 = 0;
+    TIM1->CCMR1 = (6u << 4) | (1u << 3);       /* CH1: PWM mode 1, preload */
+    TIM1->CCMR2 = (6u << 12) | (1u << 11);     /* CH4: PWM mode 1, preload */
+    TIM1->CCER  = (1u << 0) | (1u << 1)        /* CH1 enable, active low */
+                | (1u << 12) | (1u << 13);     /* CH4 enable, active low */
+    TIM1->BDTR |= (1u << 15);                  /* MOE: advanced timer outputs */
+    TIM1->CR1  |= (1u << 7) | (1u << 0);
+    TIM1->EGR   = 1;
+}
+
+/* Hand the four pins to the timers. Only ever called with a live link. */
+static void motors_engage(void)
+{
+    TIM2->CCR3 = 0; TIM2->CCR4 = 0;
+    TIM1->CCR1 = 0; TIM1->CCR4 = 0;
+    pa_af(2, 2); pa_af(3, 2); pa_af(8, 2); pa_af(11, 2);
+    motors_live = 1;
+}
+
+static void motors_set(uint8_t throttle)
+{
+    /* 0..255 -> 0..PWM_ARR without a divide, which Cortex-M0 lacks */
+    uint32_t duty = ((uint32_t)throttle * (PWM_ARR + 1)) >> 8;
+    TIM2->CCR3 = duty; TIM2->CCR4 = duty;
+    TIM1->CCR1 = duty; TIM1->CCR4 = duty;
 }
 
 /* ---- time ---- */
@@ -209,6 +281,8 @@ int main(void)
 
     uart_init();
     spi_init();
+    pwm_init();
+    motors_off();          /* pwm_init only prepared the timers; keep the pins */
 
     puts_("\r\nsima8 drone rx\r\n");
     uint8_t cfg_check = rf_rd(REG_CONFIG);
@@ -233,12 +307,18 @@ int main(void)
             else                 { bad++; }
         }
 
-        /* Failsafe. Motors are already off in this build, but the timeout is
-         * what the motor stage will hang off, so it is armed from the start. */
-        if (now - last_pkt > FAILSAFE_MS) motors_off();
+        uint32_t link_up = (now - last_pkt < FAILSAFE_MS);
+        uint32_t want = link_up && (pkt.flags & PKT_ARM);
+
+        if (!want) {
+            if (motors_live) motors_off();
+        } else {
+            if (!motors_live) motors_engage();
+            motors_set(pkt.throttle);
+        }
 
         /* LED: fast while the link is up, slow when it is not */
-        uint32_t period = (now - last_pkt < FAILSAFE_MS) ? 100 : 500;
+        uint32_t period = link_up ? 100 : 500;
         if (now - last_led >= period) {
             last_led = now;
             led ^= 1;
@@ -250,7 +330,8 @@ int main(void)
             puts_("rx good="); putdec(good);
             puts_(" bad=");    putdec(bad);
             puts_(" thr=");    putdec(pkt.throttle);
-            puts_(" link=");   puts_(now - last_pkt < FAILSAFE_MS ? "UP" : "DOWN");
+            puts_(" link=");   puts_(link_up ? "UP" : "DOWN");
+            puts_(" motor=");  puts_(motors_live ? "ON" : "off");
             puts_("\r\n");
         }
     }

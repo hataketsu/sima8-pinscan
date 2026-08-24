@@ -13,12 +13,16 @@
 #include <stdint.h>
 #include "../common/protocol.h"
 
+#define F_CPU   72000000u          /* HSE 8 MHz through PLL x9 */
+#define F_PCLK2 72000000u          /* APB2 undivided, feeds USART1 */
+
 #define RCC_APB1ENR (*(volatile uint32_t *)0x4002101Cu)
 #define PWR_CR      (*(volatile uint32_t *)0x40007000u)
 #define BKP_DR4     (*(volatile uint32_t *)0x40006C10u)
 #define SCB_AIRCR   (*(volatile uint32_t *)0xE000ED0Cu)
 #define RCC_CR      (*(volatile uint32_t *)0x40021000u)
 #define RCC_CFGR    (*(volatile uint32_t *)0x40021004u)
+#define FLASH_ACR   (*(volatile uint32_t *)0x40022000u)
 #define RCC_APB2ENR (*(volatile uint32_t *)0x40021018u)
 #define IOPAEN      (1u << 2)
 #define IOPBEN      (1u << 3)
@@ -74,7 +78,7 @@ static uint32_t millis(void)
     uint32_t now = STK_VAL;
     cyc_acc += (stk_last - now) & 0xFFFFFFu;
     stk_last = now;
-    while (cyc_acc >= 8000u) { cyc_acc -= 8000u; ms_count++; }
+    while (cyc_acc >= (F_CPU / 1000u)) { cyc_acc -= (F_CPU / 1000u); ms_count++; }
     return ms_count;
 }
 static void delay_ms(uint32_t n)
@@ -85,7 +89,7 @@ static void delay_ms(uint32_t n)
 static void delay_us(uint32_t n)          /* short waits, CE pulse width */
 {
     uint32_t start = STK_VAL;
-    uint32_t want = n * 8u;
+    uint32_t want = n * (F_CPU / 1000000u);
     while (((start - STK_VAL) & 0xFFFFFFu) < want) { }
 }
 
@@ -111,7 +115,7 @@ static void uart_init(void)
     cfg_pin(GPIOA, 9,  CNF_AF_PP);       /* TX */
     cfg_pin(GPIOA, 10, CNF_IN_FLOAT);    /* RX */
     USART1_CR1 = 0;
-    USART1_BRR = 833;                      /* 8 MHz / 9600 */
+    USART1_BRR = F_PCLK2 / 9600u;          /* 72 MHz / 9600 = 7500 */
     USART1_CR1 = (1u << 13) | (1u << 3) | (1u << 2);   /* UE, TE, RE */
 }
 static int uart_getc(void)               /* -1 when nothing is waiting */
@@ -151,7 +155,7 @@ static void spi_init(void)
     gp_lo(GPIOB, PIN_CE);
 
     SPI1_CR1 = (1u << 2)      /* MSTR             */
-             | (2u << 3)      /* BR = /8 -> 1 MHz */
+             | (5u << 3)      /* BR = /64 -> 1.1 MHz at 72 MHz PCLK2 */
              | (1u << 9)      /* SSM              */
              | (1u << 8)      /* SSI              */
              | (1u << 6);     /* SPE              */
@@ -236,25 +240,44 @@ static uint32_t rf_send(const pkt_t *p)
     return 0;
 }
 
-/* The HID bootloader runs the core at 72 MHz so it can drive USB, and hands
- * over without restoring anything. Inheriting that silently makes every timing
- * constant here wrong by 9x — the first symptom was UART output arriving at
- * roughly 86400 baud instead of 9600. The app pins the clock itself instead of
- * trusting whatever it was started with. */
-static void clock_init_hsi8(void)
+/* Clock is set here rather than inherited. The HID bootloader leaves the core at
+ * 72 MHz and hands over without restoring it, so an app that assumed the 8 MHz
+ * HSI had every timing constant wrong by 9x — UART output came out near 86400
+ * baud instead of 9600.
+ *
+ * 72 MHz is also what USB needs: the peripheral wants exactly 48 MHz, which the
+ * internal HSI cannot produce accurately enough, so this runs off the board's
+ * 8 MHz crystal through PLL x9 with the USB prescaler dividing by 1.5. */
+static void clock_init_hse72(void)
 {
-    RCC_CR |= (1u << 0);                       /* HSION */
-    while (!(RCC_CR & (1u << 1))) { }          /* HSIRDY */
+    /* The bootloader hands over with the PLL already running AND selected as
+     * the system clock. Disabling the PLL first would pull the clock out from
+     * under the core mid-instruction, so park on the HSI before touching it. */
+    RCC_CR |= (1u << 0);                        /* HSION */
+    while (!(RCC_CR & (1u << 1))) { }           /* HSIRDY */
+    RCC_CFGR &= ~3u;                            /* SW = HSI */
+    while ((RCC_CFGR & (3u << 2)) != 0) { }     /* SWS confirms HSI */
 
-    RCC_CFGR &= ~3u;                           /* SW = HSI */
-    while ((RCC_CFGR & (3u << 2)) != 0) { }    /* SWS reports HSI */
+    RCC_CR |= (1u << 16);                       /* HSEON */
+    while (!(RCC_CR & (1u << 17))) { }          /* HSERDY */
 
-    RCC_CR   &= ~(1u << 24);                   /* PLL off */
-    while (RCC_CR & (1u << 25)) { }            /* PLLRDY clear */
+    FLASH_ACR = (FLASH_ACR & ~7u) | 2u | (1u << 4);   /* 2 wait states + prefetch */
 
-    RCC_CFGR &= ~(0xFu << 4);                  /* AHB  prescaler /1 */
-    RCC_CFGR &= ~(7u << 8);                    /* APB1 prescaler /1 */
-    RCC_CFGR &= ~(7u << 11);                   /* APB2 prescaler /1 */
+    RCC_CFGR &= ~(0xFu << 4);                   /* AHB  /1  -> 72 MHz */
+    RCC_CFGR = (RCC_CFGR & ~(7u << 8))  | (4u << 8);  /* APB1 /2 -> 36 MHz, its max */
+    RCC_CFGR &= ~(7u << 11);                    /* APB2 /1  -> 72 MHz */
+
+    RCC_CR &= ~(1u << 24);                      /* PLL off while reconfiguring */
+    while (RCC_CR & (1u << 25)) { }
+    RCC_CFGR &= ~((1u << 22) | (0xFu << 18) | (1u << 17));
+    RCC_CFGR |= (1u << 16)                      /* PLL source = HSE */
+             |  (7u << 18);                     /* PLL x9: 8 -> 72 MHz */
+    RCC_CFGR &= ~(1u << 22);                    /* USB prescaler /1.5 -> 48 MHz */
+    RCC_CR |= (1u << 24);                       /* PLL on */
+    while (!(RCC_CR & (1u << 25))) { }
+
+    RCC_CFGR = (RCC_CFGR & ~3u) | 2u;           /* SW = PLL */
+    while ((RCC_CFGR & (3u << 2)) != (2u << 2)) { }
 }
 
 #define SCB_VTOR (*(volatile uint32_t *)0xE000ED08u)
@@ -266,7 +289,7 @@ int main(void)
      * this build polls rather than using interrupts, but leaving VTOR stale is
      * a trap for the first interrupt anyone adds later. */
     SCB_VTOR = APP_BASE;
-    clock_init_hsi8();
+    clock_init_hse72();
 
     RCC_APB2ENR |= IOPAEN | IOPBEN | AFIOEN;
     STK_LOAD = 0x00FFFFFFu; STK_VAL = 0; STK_CTRL = 5;
